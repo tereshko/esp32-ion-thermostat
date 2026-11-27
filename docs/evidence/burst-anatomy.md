@@ -31,6 +31,27 @@ Source: `phase3-validation3-20261103-145755.jsonl`. All frames within ±1.2 s of
 
 `2026-11-03T19:57:57.175Z  44→20  func 06  reg 0306  data 010000000000C808CA00`
 
-The burst is the thermostat's heartbeat: 0305 (demand), 0605 (compressor
-capacity), 060D (call flag) and 061E (coil parameter) to the outdoor unit,
-interleaved with the poll tiers.
+The same cycle's outdoor-unit group follows ≈5.7 s later (timestamps
+relative to the 0305 above):
+
+`2026-11-03T19:58:01.702Z  20→53  func 0C  reg 0610  data 00000000`
+
+`2026-11-03T19:58:01.747Z  20→53  func 0C  reg 0612  data 22B80000000000000000`
+
+`2026-11-03T19:58:01.792Z  20→53  func 0C  reg 0605  data 00000000000001`
+
+`2026-11-03T19:58:01.835Z  20→53  func 0C  reg 061A  data 01`
+
+`2026-11-03T19:58:01.880Z  20→53  func 0C  reg 060D  data 00`
+
+`2026-11-03T19:58:01.927Z  20→53  func 0C  reg 061E  data 0F3FD851EC06000000`
+
+`2026-11-03T19:58:01.972Z  20→53  func 0C  reg 060B  data 0104BE00000000`
+
+`2026-11-03T19:58:02.000Z  20→44  func 0C  reg 0414  data 0104BE010320`
+
+The burst is the thermostat's heartbeat, in two groups ≈5.7 s apart:
+the furnace group (0305 demand, 0403, 0409, 0307) and the outdoor-unit
+group (0605 compressor capacity, 060D call flag, 061E coil parameter,
+the constants 0610/0612/061A and the paired 060B/0414), interleaved
+with the poll tiers.

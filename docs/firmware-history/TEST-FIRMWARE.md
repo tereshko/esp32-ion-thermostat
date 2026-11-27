@@ -1,7 +1,7 @@
 # TEST FIRMWARE — Variant B direct-write test build
 
 One-off, supervised test build for the experiment specified in
-`../DIRECT-WRITE-RESEARCH.md` §5 (Variant B): steer a **wall-armed** hold
+`../firmware-analysis/DIRECT-WRITE-RESEARCH.md` §5 (Variant B): steer a **wall-armed** hold
 by rewriting the thermostat's zone-1 comfort row (register **400A**),
 manual entry, one byte at a time (offset **29** = manual cool,
 offset **28** = manual heat), whole °F, full-row read-modify-write,
@@ -12,7 +12,7 @@ wall: the Ion stores this build's 400A manual-entry writes from the
 unregistered SAM node (six consecutive polls over 24 min returned the
 written byte) and its manual screen adopts bus-written setpoints
 (criteria 6a/6b pass, 6c partial). Full report:
-`../400A-TEST-RESULT.md`. Roll back to phase2 after use.
+`../firmware-analysis/400A-TEST-RESULT.md`. Roll back to phase2 after use.
 
 ---
 

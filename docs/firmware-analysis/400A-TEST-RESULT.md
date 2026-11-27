@@ -1,5 +1,10 @@
 # 400A direct-write test — RESULT (2026-10-30)
 
+> Evidence policy: the wall photos and capture files this report
+> cites are not redistributed in this repository (see README). The
+> inspectable record is the frame quotes and counts in
+> `docs/evidence/`.
+
 Test: `DIRECT-WRITE-RESEARCH.md` §5, Variant B. Build:
 `firmware/phase3-test.yaml` (phase2 + additive test methods in
 `firmware/test-components/`; write only on HA button press, full-row

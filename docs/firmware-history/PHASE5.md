@@ -122,7 +122,7 @@ automations are wired to it in the yaml. Inert.
 | # | Path | Verdict |
 |---|---|---|
 | T1 | Fast poll: READ 3B02/3B03 to 0x20, alternating, every 3 s, idle-gated, suppressed during retransmit iterations and discovery holdoff | safe (reads) |
-| T2 | Slow poll: every 31 s, rotation over 400A + {0104, 3B04, 4012, 4202, 3B05, 3D02, 4608, 4609, 460A} (a full rotation ≈ 4 min 40 s — the cadence PHASE3-CONTROL quotes) | safe (reads) |
+| T2 | Slow poll: one table per 31 s tick, rotating over 400A + {0104, 3B04, 4012, 4202, 3B05, 3D02, 4608, 4609, 460A} (a full rotation ≈ 4 min 40 s — the cadence PHASE3-CONTROL quotes). Comfort rows ride first in the rotation: zone 1's 400A is read on the first tick after the poll engine starts, then once per full rotation | safe (reads) |
 | T3 | ODU slow poll: every 31 s {0304, 3E01, 3E02, 3E08} | safe (reads) |
 | T4 | Discovery probes from 0x93 every 3.5 s (READ tabledef 0xNN01 of observed devices) | safe (reads) |
 | T5 | SAM emulation replies/exceptions to thermostat requests addressed to 0x92; store + ACK-echo for writes addressed to 0x92 | safe by design (reactive; this is what a real SAM does; on this Ion the thermostat essentially only answers our polls) |
@@ -290,8 +290,10 @@ Design rules and how each is met:
    (see the loop proof, §6 check 2). **Boot state:** the numbers
    are never restored from Home Assistant (`restore_value: false`
    throughout) — after a reboot they show placeholders until the
-   first 400A read populates the cache (first T2 rotation, ≈5 min
-   worst case) and the 45 s sync converges them to the wall's
+   first 400A read populates the cache (400A rides the first T2
+   rotation slot — first read within ~31 s of the poll engine
+   starting; allow ≈5 min after flashing for full convergence, as
+   in phase 3) and the 45 s sync converges them to the wall's
    stored bytes; a set_action against an unpopulated cache is
    refused by the freshness guard (rule 2). Same behaviour as
    phase 3 (PHASE3-CONTROL, read-back sync). Editing a profile row
@@ -387,8 +389,9 @@ they were seed/zero artifacts too.
 3. After it boots, **wait ≥ 5 minutes** before judging
    anything: the node must complete slow-poll cycles so the
    400A row is cached and the bus-health gate opens (first
-   thermostat replies arrive within seconds; the row within
-   one 31 s rotation). Writes against an uncached/stale row or
+   thermostat replies arrive within seconds; the row on the
+   first slow-poll tick — 400A is the rotation's first slot, so
+   within ~31 s). Writes against an uncached/stale row or
    an unanswered bus are refused by the guards — harmless log
    lines, no frames.
 

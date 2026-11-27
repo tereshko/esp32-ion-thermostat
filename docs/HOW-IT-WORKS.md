@@ -40,11 +40,12 @@ is why any replacement needs a temperature sensor of its own.
   (polynomial A001, init 0), transmitted little-endian after a final
   byte swap. The exact builder routine was recovered from the firmware
   image and reproduces every captured frame.
-- Function `0x06` = read a table, `0x0C` = write a table (full
-  read-modify-write of the whole table image), `0x0D` = a directed
-  one-byte flag write. Tables are addressed by a 16-bit id whose high
-  byte names the owning device class (03xx/04xx thermostat, 06xx
-  outdoor unit, 3Bxx SAM, 40xx the shared comfort table).
+- Function `0x0B` = read a table (the request), `0x06` = the read
+  response, `0x0C` = write a table (full read-modify-write of the
+  whole table image). This dialect has no write-acknowledgement
+  function. Tables are addressed by a 16-bit id whose high byte
+  names the owning device class (03xx/04xx furnace, 06xx outdoor
+  unit, 3Bxx SAM, 40xx the shared comfort table).
 - Frame payloads are built from per-class *staging blobs*: the
   thermostat keeps a RAM image per outgoing table and serialises it on
   schedule. An emulator therefore needs the same images, not ad-hoc
@@ -54,8 +55,9 @@ is why any replacement needs a temperature sensor of its own.
 
 The thermostat runs a fixed poll schedule in tiers (≈3/5/7/10/11/17/20/
 29/31 s). The furnace and the outdoor unit are polled for identity,
-status and operating data; the SAM is polled for its 3B02/3B03 tables
-(median period 3.00 s, strictly alternating).
+status and operating data. The SAM slot is the mirror image: the
+node at 0x92 polls the thermostat's 3B02/3B03 tables (median period
+3.00 s, strictly alternating) and is served zeros (§6).
 
 Every ≈10 s the thermostat emits the **command burst** — the frames
 that actually run the house:
@@ -115,9 +117,12 @@ proven live (§6). Two behaviours define the contract:
 
 **Served tables.** Anything that replaces the thermostat must also
 *answer*: peers poll the thermostat's own tables. The served set and
-exact reply lengths are known per table (e.g. `0302` is answered with
-24 B to the outdoor unit but 12 B to the furnace — replies are
-per-requester). The SAM-facing tables are the exception: see §6.
+its sizes are the DIR-C directory's (EMULATOR-SPEC §4.1) — e.g. the
+thermostat's own served `0302` image is 32 B. Do not confuse these
+with the equipment's answers to the thermostat's reads of the same
+table ids (24 B from the outdoor unit, 12 B from the furnace for
+`0302`): the two directions have different sizes. The SAM-facing
+tables are the exception: see §6.
 
 **The coil parameter.** The evaporator coil identifies itself at
 commissioning; the thermostat stores one float per coil model (263
@@ -195,6 +200,8 @@ the demand pipeline reproduces the original arithmetic exactly.
   been observed — §12.
 - **Blower CFM** is a computed float: `CFM ≥ max(base, 325 × demand /
   12000)` with the demand term applied only in demand-driven modes.
+  (Simplified form — the full floor, the gating byte and the
+  per-mode clamps are EMULATOR-SPEC §5.6.)
   The per-ton family in firmware is {175…400}; observed on the wire:
   {0, 378–384, 1166, 1232, 1368, 1617, 1660, 1710, 1750, 1760}.
 - **Setpoint coordinates** convert through a size/temperature table

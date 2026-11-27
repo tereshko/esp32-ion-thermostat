@@ -55,3 +55,56 @@ them. Behavioural rules live in the guide (§11) and PHASE5/PHASE6.
 Entity ids the package expects on the node side (check at install):
 `binary_sensor.diy_thermostat_compressor_running`,
 `sensor.diy_thermostat_blower_rpm`.
+
+## Node entity inventory (as defined in `firmware/thermostat.yaml`)
+
+- Numbers: the ten profile setpoints ("Home/Away/Sleep/Wake/Manual
+  Heat Setpoint °F" and "… Cool Setpoint °F"), "Room Target °F",
+  "Anticipation %", "Fan Minutes Per Hour", "Dead-man Hours", and
+  **"HA Heartbeat"** — a template number, min 0 / max 2,000,000,000 /
+  step 1, mode box, `restore_value: false` (it reads 0 = "never
+  received" after every reboot, by design).
+- Selects: "Home/Away/Sleep/Wake/Manual Fan Mode".
+- Switches: "Sensor Steering", "Fan Circulation",
+  "Fan Control Enable", "Dead-man Return" (all default OFF).
+- Sensors: "Room 1 Temperature / Humidity / Battery",
+  "Room 2 Temperature / Humidity / Battery" (both `atc_mithermometer`),
+  "Bus Reply Age", "WiFi Signal"; text sensor "Device Status";
+  binary sensor "Bus Healthy".
+- Hub-spawned telemetry (defined by the `infinitesp` component, not
+  the YAML): furnace/ODU registers — blower RPM, airflow, stages,
+  runtimes, ODU temperatures/pressures — and accessory-life sensors.
+  The two ids the HA package depends on are listed in the CHECK note
+  above; the full spawn set is the component's entity reference.
+
+## Home Assistant package — automation logic in one line each
+
+- `script.hvac_apply_period` — writes one period's pair (or the
+  vacation pair, in Vacation mode) into the node's Manual Heat/Cool
+  numbers. `script.hvac_apply_current_period` — picks the period
+  from the current time against the three start datetimes, then
+  applies it.
+- `hvac_period_boundaries` — time triggers at the three period
+  starts: in Schedule mode applies the new period; in Temporary
+  Hold a boundary ends the hold (mode returns to Schedule, the new
+  period applies). Permanent Hold and Vacation ignore boundaries.
+- `hvac_hold_mode_changed` — on any change of `hvac_hold_mode`:
+  entering Schedule applies the current period; entering Vacation
+  applies the vacation pair; Temporary/Permanent Hold change
+  nothing until the user sets a pair on the device / the next
+  boundary.
+- `hvac_vacation_end` — at `hvac_vacation_until`: if the mode is
+  Vacation, returns it to Schedule and applies the current period.
+- `hvac_ha_heartbeat` — every 5 min (and at HA start) writes the
+  current epoch into `number.diy_thermostat_ha_heartbeat`.
+- `hvac_node_offline_alert` — the node's Manual Heat number
+  unavailable for over an hour → persistent notification
+  `hvac_node_offline`. `hvac_node_back_alert_clear` — the number
+  returns → the notification is dismissed.
+- `hvac_filter_reminder` — hourly check: real blower hours since
+  `hvac_filter_changed_at` at or over `hvac_filter_hours_limit`
+  and the reminder not yet sent → notification + sets
+  `hvac_filter_reminder_sent`. `hvac_filter_changed` — when
+  `input_boolean.hvac_filter_changed` is turned on: stamps
+  `hvac_filter_changed_at` to now, clears the reminder flag and
+  notification, turns itself back off.

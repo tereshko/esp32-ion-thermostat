@@ -45,7 +45,7 @@ buffer on 2026-10-30. Verdict-changing file:
   hypothesis is retracted for this window. Only attempt #2 (FULL INSTALLATION,
   15:02) remains unverified — the SAM was inexplicably silent in that file.
 
-## 400A direct-write test session (2026-10-30) — full result in ../400A-TEST-RESULT.md
+## 400A direct-write test session (2026-10-30) — full result in ../firmware-analysis/400A-TEST-RESULT.md
 
 Four sequential captures of one session (the author at the wall). Verdict:
 writes from the UNREGISTERED SAM node to the thermostat's 400A row

@@ -28,8 +28,9 @@ below. This note is the missing first link of the delta chain.
   the gate is an internal runtime binding in the thermostat image,
   not a bus transaction. An unregistered SAM is served all-zero
   `3B02`/`3B03` (`../evidence/sam-zero-mirror.md`) and its writes are
-  silently ignored. Full research: `../research/` (SAM registration
-  research) and the firmware-analysis stages on the SAM contract.
+  silently ignored. Full research:
+  `../firmware-analysis/SAM-REGISTRATION-RESEARCH.md` and the
+  firmware-analysis stages on the SAM contract.
 - The pivot that closed the phase: registration is unnecessary —
   the 400A comfort table honours writes from the SAM slot without it
   (`../evidence/400a-write-test.md`). Phase 3 built production

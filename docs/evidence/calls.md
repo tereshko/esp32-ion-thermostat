@@ -23,6 +23,7 @@ The call switching on — last idle frames, then the first at full capacity:
 Cooling segment (ts, CFM, heat stage, cool stage):
 
 - 2026-10-29T17:07:05.999Z — CFM 0, heat stage 0, cool stage 0
+- 2026-10-29T17:07:26.118Z — CFM 0, heat stage 0, cool stage 2
 - 2026-10-29T17:09:27.116Z — CFM 1232, heat stage 0, cool stage 2
 - 2026-10-29T17:10:57.000Z — CFM 1760, heat stage 0, cool stage 2
 - 2026-10-29T17:11:37.579Z — CFM 1710, heat stage 0, cool stage 2

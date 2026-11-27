@@ -1176,7 +1176,10 @@ lockouts, the Bristol ×0.63 ODU multiplier, the 3E-family ODU tables
 (`0602`, `0606`/`0607`/`0609`, `061B`, `061C`, `061D`), zoning and
 simultaneous heat+cool: all are code for other equipment classes; this
 ODU is a cooling-only variable-speed unit and this furnace is the sole
-heat source. [T §8, §9]
+heat source. [T §8, §9] (Note on `0602`: the thermostat does read it
+on the ~17 s tier, §1.2 — it is listed here because its semantics are
+3E-family and unused by the control law, not because the read does
+not happen; an emulator issues the read like any other tier member.)
 
 ### 6.8 Dehumidification (optional, default OFF)
 
@@ -1380,7 +1383,9 @@ recovery time are still unmeasured (§11 T-1).
 2. **Takeover delay — lower bound.** Ion's maximum steady-state TX gap
    is 2.81 s (4.90 s in wizard phases). The silence threshold for
    declaring Ion dead must exceed this by a wide margin; the parent
-   design listens silently for ≥ 2 min before assuming any active role.
+   design listens silently for ≥ 2 min after its own boot before
+   assuming any active role. (That ≥2 min is the startup rule, not
+   the takeover threshold — the threshold is rule 3 below.)
    [Map (d), U §4]
 3. **Takeover delay — upper bound.** The ODU enters standby ≈ **2 min**
    after its last valid message (COMM LED off at 2 min) [Y §6]. Standby

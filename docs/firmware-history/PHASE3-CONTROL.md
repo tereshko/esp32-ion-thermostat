@@ -1,7 +1,7 @@
 # PHASE 3 CONTROL — production direct-write build
 
 Production build on the path proven at the wall on 2026-10-30
-(`../400A-TEST-RESULT.md`): Home Assistant owns the Ion's Touch-N-Go
+(`../firmware-analysis/400A-TEST-RESULT.md`): Home Assistant owns the Ion's Touch-N-Go
 **manual** setpoints via guarded direct writes to register **400A**
 (zone-1 comfort row, byte **28** = manual heat, byte **29** = manual
 cool, whole °F, full-row read-modify-write, func 0x0C to 0x20).
@@ -21,7 +21,7 @@ wall lives on Touch-N-Go MANUAL, HA owns the two manual setpoints.**
 | Piece | What it is |
 |---|---|
 | `phase3-control.yaml` | phase2.yaml + control surface (§3). Same device name, `sam_address: 0x92`, climate "House", BLE/Wi-Fi/status entities — the HA device and all its existing entities are untouched. |
-| `control-components/` | Byte-for-byte copy of the stock tree (`../infinitesp/components/`: bus_jsonl, infinitesp, sam_ascii, uart_rmtx) with **one additive feature** in the infinitesp hub, verified by diff: 0 stock lines modified or removed, changes confined to `infinitesp/infinitesp.h` / `infinitesp.cpp`. |
+| `control-components/` | Byte-for-byte copy of the stock tree (`../../firmware/components/infinitesp/`: bus_jsonl, infinitesp, sam_ascii, uart_rmtx) with **one additive feature** in the infinitesp hub, verified by diff: 0 stock lines modified or removed, changes confined to `infinitesp/infinitesp.h` / `infinitesp.cpp`. |
 | `PHASE3-CONTROL.md` | This file. |
 
 ## 2. The hub feature (control-components/infinitesp)
