@@ -23,21 +23,21 @@ The call switching on — last idle frames, then the first at full capacity:
 Cooling segment (ts, CFM, heat stage, cool stage):
 
 - 2026-10-29T17:07:05.999Z — CFM 0, heat stage 0, cool stage 0
-- 2026-10-29T17:09:27.116Z — CFM 53252, heat stage 0, cool stage 2
-- 2026-10-29T17:10:57.000Z — CFM 57350, heat stage 0, cool stage 2
-- 2026-10-29T17:11:37.579Z — CFM 44550, heat stage 0, cool stage 2
-- 2026-10-29T17:12:38.000Z — CFM 31750, heat stage 0, cool stage 2
+- 2026-10-29T17:09:27.116Z — CFM 1232, heat stage 0, cool stage 2
+- 2026-10-29T17:10:57.000Z — CFM 1760, heat stage 0, cool stage 2
+- 2026-10-29T17:11:37.579Z — CFM 1710, heat stage 0, cool stage 2
+- 2026-10-29T17:12:38.000Z — CFM 1660, heat stage 0, cool stage 2
 
 Heating segment (setpoint staircase 75→79 °F at the wall):
 
 - 2026-10-29T17:16:00.128Z — CFM 0, heat stage 0, cool stage 0
-- 2026-10-29T17:16:19.999Z — CFM 36356, heat stage 0, cool stage 0
-- 2026-10-29T17:17:30.072Z — CFM 32769, heat stage 0, cool stage 0
-- 2026-10-29T17:18:30.272Z — CFM 32769, heat stage 1, cool stage 0
+- 2026-10-29T17:16:19.999Z — CFM 1166, heat stage 0, cool stage 0
+- 2026-10-29T17:17:30.072Z — CFM 384, heat stage 0, cool stage 0
+- 2026-10-29T17:18:30.272Z — CFM 384, heat stage 1, cool stage 0
 - 2026-10-29T17:19:20.967Z — CFM 0, heat stage 1, cool stage 0
-- 2026-10-29T17:20:11.000Z — CFM 22533, heat stage 1, cool stage 0
-- 2026-10-29T17:20:31.253Z — CFM 22533, heat stage 2, cool stage 0
-- 2026-10-29T17:20:51.233Z — CFM 20742, heat stage 2, cool stage 0
+- 2026-10-29T17:20:11.000Z — CFM 1368, heat stage 1, cool stage 0
+- 2026-10-29T17:20:31.253Z — CFM 1368, heat stage 2, cool stage 0
+- 2026-10-29T17:20:51.233Z — CFM 1617, heat stage 2, cool stage 0
 
 The thermostat commands; the boards execute and protect. The cooling call
 runs at capacity 5.0 from its first burst — sustained part-load has never

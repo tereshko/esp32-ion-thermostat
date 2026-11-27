@@ -174,9 +174,13 @@ The wire CRC is computed by `FUN_180a42dc` [AA §1]:
 - The CRC covers the whole frame from byte [0] through the last payload
   byte (receiver validates over `buffer, count − 2`). [AA §5]
 - Verification status: the routine equals the standard reflected-A001 CRC
-  on 2000/2000 random buffers, 1532/1532 gofinity wire frames, and
-  101352/101352 reconstructed frame bodies from this installation's
-  captures. [AA §1]
+  on 2000/2000 random buffers and 1532/1532 gofinity wire frames,
+  and it reproduces the checksum field of 101,352 frame bodies
+  reconstructed from this installation's captures. Wire-level
+  verification on the installation's own captures is impossible —
+  the JSONL corpus stores no CRC bytes — and the verification corpus
+  rules that half UNVERIFIABLE (verification/VERIFY-crc.md); the
+  wire proof is the gofinity capture. [AA §1]
 
 ### 2.4 Frame construction — directories and staging buffers
 
@@ -1281,8 +1285,10 @@ after 2 min. Defrost values are heat-pump-only — N/A here. [Y §6]
    demand to "retry" the equipment.
 3. **Bus cadence is a safety input.** A > 2 min gap stands the ODU down
    mid-call (§10). The existing DIY-node guards (no writes if the wall
-   is silent > 60 s; at most 1 write per 10 s) are compatible with, and
-   stricter than, this constraint.
+   is silent > 60 s; at most 1 write per 10 s — two of the node's
+   eight write-core guards; the complete enforced set is listed in
+   firmware-history/PHASE5 §2) are compatible with, and stricter
+   than, this constraint.
 
 ---
 

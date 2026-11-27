@@ -148,7 +148,10 @@ activity bytes changed is honoured by the thermostat within one poll
 cycle. The production rules the node firmware enforces:
 
 - Write only while Touch-N-Go Manual is active; otherwise the write is
-  silently re-seeded away.
+  silently re-seeded away. This is an operating contract, not a
+  firmware guard: the wall's mode is not visible over the SAM
+  interface, so the write-core cannot check it — the eight enforced
+  guards are the complete set in firmware-history/PHASE5 §2.
 - Always read-modify-write the full 35-byte image; never write a
   partial table.
 - Guard the pair: cool ≥ heat + 3 °F; equal values are a no-op; the
@@ -236,8 +239,12 @@ the evidence supports:
    2.81 s. The takeover delay is bounded by measurement on both
    sides — equipment tolerates **more than 36 s** of thermostat
    silence without a fault (proven by a reseat capture), and the
-   outdoor unit drops the call at ≈2 min. A 20 s silence threshold
-   sits comfortably inside the window.
+   outdoor unit drops the call at ≈2 min. The takeover threshold
+   therefore has to sit above the proven 36 s and below ≈2 min, and
+   the design additionally listens silently for ≥2 min after its own
+   boot before assuming any active role (EMULATOR-SPEC §10). The
+   exact takeover value stays a calibration item until the
+   thermostat's own recovery time is measured.
 3. **The stock control always wins.** The instant a genuine `0x20`
    (or boot persona `0x1F`) frame is heard, the node stops
    transmitting and falls back to mirror mode. No bus fight, ever.
@@ -276,9 +283,13 @@ node build; `firmware/home-assistant.yaml` is its HA package.
   blower RPM, compressor state, outdoor temperature, bus health).
 - Control: ten setpoint numbers (heat/cool × 5 activities) through the
   single guarded write-core of §6 — no climate component.
-- Sensor steering: optional BLE room sensor feedback (target = wall
-  reading + wall-to-room offset), inert when the sensor is stale
-  (>15 min) — no writes without fresh data.
+- Sensor steering: optional BLE room sensor feedback — the stored
+  manual bytes are nudged toward the room target (error = target −
+  sensor, step clamped to ±6 °F per 30 s tick, ±0.7 °F settled band),
+  inert when the sensor is stale (>15 min) — no writes without fresh
+  data. (The phase-4 gradient form, which steered by the wall
+  reading, is superseded: this thermostat serves no wall temperature
+  to a SAM. See firmware-history/PHASE5 §3.)
 - Fan circulation with call credit: real heating/cooling fan minutes
   count toward the hourly circulation target; the node only tops up
   the remainder, and only under its ownership rules.
@@ -291,6 +302,10 @@ node build; `firmware/home-assistant.yaml` is its HA package.
   modes (Schedule / Temporary / Permanent / Vacation with a 55/85 °F
   vacation pair), a 5-minute heartbeat, node-offline alert, and a
   filter reminder driven by real blower hours.
+
+File-level facts (core blocks, helper entity ids, scripts and
+automations, sensor platforms): `docs/ENTITY-INDEX.md`. The build
+history starts at `docs/firmware-history/PHASE1-2.md`.
 
 ## 12. What is still unknown (data, not code)
 

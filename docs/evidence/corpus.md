@@ -21,3 +21,10 @@ reader can reproduce from the same files.
 - **sam-reseat-20261029-151123.jsonl** — 1,611 frames, 4 min, 2026-10-29T19:11:24.000Z … 2026-10-29T19:14:56.344Z; top talkers: 20→46 ×314, 20→44 ×201, 44→20 ×174
 
 Main files total: **83,758 frames** (plus the seven coldstart segments in `segments/`, which are time-slices of the coldstart file, and the external gofinity boot capture cross-checked in `../research/gofinity-bootup.md`).
+
+Counting rules, reconciled: **83,758** above is the line-by-line total of
+the main files; the protocol map's **83,752** is the distinct-session total
+(six glued/duplicated lines counted once — verification correction V-9);
+**101,352** adds the coldstart segment files; the guide's "≈84,000" is the
+rounded main-file figure; the "~75,000" in firmware-history/PHASE5 §1.3 is
+an early estimate from before this inventory existed.
