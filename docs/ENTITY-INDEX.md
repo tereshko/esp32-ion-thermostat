@@ -14,7 +14,9 @@ them. Behavioural rules live in the guide (§11) and PHASE5/PHASE6.
   N16R8; the shipped node build targets the classic ESP32.)
 - Blocks present: `logger:` (USB serial), `api:`, `ota:`, `wifi:`
   (credentials via `secrets.yaml`, never in the repo),
-  `external_components:` (local `components/`), `uart:` — bus UART
+  `external_components:` — the local `components/` **plus a git
+  component** (`esphome-uart-link`, provider of the two TCP servers;
+  the build does not compile without it), `uart:` — bus UART
   38400 8N1, TX → GPIO17 side / RX → GPIO16 side of the RS-485
   module (module TXD → GPIO16, RXD → GPIO17), `esp32_ble_tracker:`
   (passive), `time:` — `sntp` (id `sntp_time`) next to the HA clock.
@@ -41,7 +43,8 @@ them. Behavioural rules live in the guide (§11) and PHASE5/PHASE6.
   `hvac_night_heat` / `hvac_night_cool` (68/76),
   `hvac_vacation_heat` / `hvac_vacation_cool` (55/85),
   `hvac_filter_hours_limit` (default 1000 h).
-- `input_boolean.hvac_filter_reminder_sent`, `hvac_filter_changed`.
+- `input_boolean.hvac_filter_reminder_sent`; `input_button.hvac_filter_changed`
+  (a momentary button, not a boolean).
 
 ## Home Assistant package — scripts & automations
 
@@ -64,13 +67,14 @@ Entity ids the package expects on the node side (check at install):
   **"HA Heartbeat"** — a template number, min 0 / max 2,000,000,000 /
   step 1, mode box, `restore_value: false` (it reads 0 = "never
   received" after every reboot, by design).
-- Selects: "Home/Away/Sleep/Wake/Manual Fan Mode".
+- Template sensors (read-only): "Home/Away/Sleep/Wake/Manual Fan
+  Mode" — they mirror the 400A fan bytes; not selects, not settable.
 - Switches: "Sensor Steering", "Fan Circulation",
   "Fan Control Enable", "Dead-man Return" (all default OFF).
 - Sensors: "Room 1 Temperature / Humidity / Battery",
   "Room 2 Temperature / Humidity / Battery" (both `atc_mithermometer`),
-  "Bus Reply Age", "WiFi Signal"; text sensor "Device Status";
-  binary sensor "Bus Healthy".
+  "Bus Reply Age", "WiFi Signal"; binary sensors "Bus Healthy" and
+  "Device Status" (ESPHome status platform).
 - Hub-spawned telemetry (defined by the `infinitesp` component, not
   the YAML): furnace/ODU registers — blower RPM, airflow, stages,
   runtimes, ODU temperatures/pressures — and accessory-life sensors.
@@ -104,7 +108,88 @@ Entity ids the package expects on the node side (check at install):
 - `hvac_filter_reminder` — hourly check: real blower hours since
   `hvac_filter_changed_at` at or over `hvac_filter_hours_limit`
   and the reminder not yet sent → notification + sets
-  `hvac_filter_reminder_sent`. `hvac_filter_changed` — when
-  `input_boolean.hvac_filter_changed` is turned on: stamps
+  `hvac_filter_reminder_sent`. `hvac_filter_changed` — when the
+  `input_button.hvac_filter_changed` button is pressed: stamps
   `hvac_filter_changed_at` to now, clears the reminder flag and
-  notification, turns itself back off.
+  notification.
+
+## Settings defaults and steering clamps (code values)
+
+- "Room Target °F": default 72, range 60–80. "Anticipation %":
+  default 80, range 50–95. "Fan Minutes Per Hour": default 15,
+  range 5–60.
+- After the ±6 °F steering step, the desired pair is clamped into
+  the corridors heat 60–80 / cool 68–86 before the write-core sees
+  it. The ten profile numbers' boot placeholders: Home 68/76,
+  Away 60/80, Sleep 68/76, Wake 68/76, Manual — the wall's stored
+  pair once read.
+
+## The HA package's own entities
+
+- `binary_sensor.furnace_running` (template: compressor running OR
+  blower RPM > 0) and `sensor.filter_runtime_hours` (history_stats
+  over Furnace Running since `hvac_filter_changed_at`) — defined by
+  the package itself, not by the node.
+
+## HA package — edge cases a rebuilder must keep
+
+- Time triggers have **no catch-up**: if HA is down across a period
+  boundary, that period's pair is not applied until the next
+  boundary. If HA is down at "Vacation Until", the mode stays
+  Vacation (boundaries ignore it) until HA is back *and* the end is
+  re-triggered or the mode is changed by hand.
+- `input_datetime.hvac_vacation_until` has **no initial value**:
+  set it before choosing Vacation — a Vacation with no end date
+  never ends on its own.
+- `hvac_apply_current_period` assumes the period order
+  night < day < evening in its template comparisons; keep the three
+  start helpers in that order.
+
+## What the node serves as a SAM (its own register image)
+
+The hub answers reads at 0x92 from its seeded register image
+(unknown registers get a func-0x15 exception, code 0x04):
+
+- `0104` (120 B): device "SYSTEM ACCESS MODULE", model
+  "InfinitESP--SAM", serial "1726ESP32SAM01", software = build date.
+- `040E` (17 B): "P3534315" + 0x02 — byte-exact from a physical SAM;
+  an exception here makes a thermostat disown the SAM.
+- `0420` (20 B): captured interface config, undecoded.
+- `3B02` (29 B): seed — active zones 0x01, 70 °F temps, 50 %
+  humidity, stagmode OFF, displayed zone 1.
+- `3B03` (150 B): seed — heat 68 / cool 76 per zone, names
+  "Zone 1"…"Zone 8".
+- `3B05` (11 B): zeros until the thermostat's own image replaces
+  them via the slow poll. `3B06` (52 B): dealer/config seed
+  (dealer "InfinitESP"). `3B0E` (1 B): 0. `030D` (7 B): zeros.
+- Writes addressed to the SAM are stored (except `0104`, which is
+  identity-protected) and ACK-echoed.
+- Also in the component, inert in this build (no addresses in the
+  YAML): full ZC (0x60/0x61) and NIM emulation subsystems.
+
+## Console surface (TCP 23, no authentication — LAN trust only)
+
+- **Write verbs are disabled in this build**: any line containing
+  `!` is answered `NAK DISABLED` before any setter is reached
+  (HELP states it plainly). The stock implementations remain
+  compiled below that early return — see the standing warning in
+  `firmware/README.md`.
+- Read grammar (live): system `MODE? OAT? DAY? TIME? ZONE? CFGEM?`;
+  per-zone `Z#RT? Z#RH? Z#HTSP? Z#CLSP? Z#FAN? Z#HOLD? Z#NAME? …`;
+  accessories `FILTRLVL? UVLVL? HUMLVL? VENTLVL?` + `…RMD?` forms;
+  vacation `VACAT? VACDAYS? …`; config/dealer `CFGDEAD? CFGCPH?
+  DEALER? BLIGHT? …`; `HELP`.
+- `REPORT?` streams the hub's full JSON bus diagnostic (register
+  census, poll diagnostics, hold-event audit ring) to any connected
+  client. On this thermostat the read verbs answer from the node's
+  seed/zero mirror — they describe the node's image, not the wall.
+
+## Room-sensor flashing (owner-performed)
+
+The LYWSD03MMC units are flashed with ATC firmware via the Telink
+web flasher. Load-bearing details: advertising must be **ATC1441**
+(the `atc_mithermometer` platform parses only that format; PVVX is
+ignored), values in °C, and the advertising interval is set in the
+flasher (Room 2 = 5000 ms). MAC addresses and flasher settings live
+only in the owner's `secrets.yaml` / flasher session — the repo
+carries placeholders by design.

@@ -71,7 +71,7 @@ timer. [OBS + INF]
 | Read | Answer |
 |---|---|
 | 20→53 `0302` | 24 B TLV sensor block (raw/16 = °F/PSI [SRC]); bytes drift slowly with conditions |
-| 20→53 `0303` | TLV, pressures [SRC] — semantics [SRC]-only, but the wire status is verified: 0x20 polls it 1,314× and receives live 4 B answers (96 distinct payloads). Firmware-side: 0303 **has** binding groups (device classes 0x51/0x52/0x56/0x57/0x5B) although it is absent from the unified catalog (this corrects stage N §8, which states the opposite) |
+| 20→53 `0303` | TLV, pressures [SRC] — semantics [SRC]-only, but the wire status is verified: 0x20 polls it 1,316× and receives live 4 B answers (round-3 recount; earlier text said 1,314) (96 distinct payloads). Firmware-side: 0303 **has** binding groups (device classes 0x51/0x52/0x56/0x57/0x5B) although it is absent from the unified catalog (this corrects stage N §8, which states the opposite) |
 | 20→44 `0307` (read) | 3 B, always `000000` in every capture |
 | 20→44 `0413`, `041B` | Table-04 (VARSPEED blower-drive) rows [SRC] |
 | 20→53 `0604` | Compressor speed: target RPM [0..1], current [2..3] [SRC] |
@@ -118,7 +118,7 @@ changes appear by the *next* burst carrying new values. [OBS]
 To furnace 0x44:
 | Reg | Len | Idle payload | Semantics |
 |---|---|---|---|
-| `0305` | 12 | `000000000000000000000078` | **THE demand write.** [0] = heat stage, [2] = cool stage, [4..5] = BE16 blower CFM command [SRC]. Last byte `78` in all steady-state writes (`00` in the SystemInit frames and the two commissioning windows — 25 frames in the archive); verified on all 677 deduplicated 0305 writes in the current archive. Scenario values in (e). Producer attribution: [0]'s heat staging producer is unisolated in firmware — see (e). |
+| `0305` | 12 | `000000000000000000000078` | **THE demand write.** [0] = heat stage, [2] = cool stage, [4..5] = BE16 blower CFM command [SRC]. Last byte `78` in all steady-state writes (`00` in the SystemInit frames and the two commissioning windows — 25 frames in the archive); verified on all 677 deduplicated 0305 writes in the current archive (677 includes 3 SystemInit-persona frames; 674 are 0x20 steady-state writes). Scenario values in (e). Producer attribution: [0]'s heat staging producer is unisolated in firmware — see (e). |
 | `0403` | 4 | `00010100` | Constant in every scenario [OBS]; semantics unknown |
 | `0409` | 4 | `00010000` | Constant in every scenario [OBS]; semantics unknown (note: `0409` is also *read* from 44 on the ~11 s tier) |
 | `0307` | 4 | `00000000` | Constant write; distinct from the 3 B `0307` read answer |
@@ -441,7 +441,7 @@ replays them as constants. [OBS]
   1617, bytes [6..7] `02A8` (vs `C808` idle — gas-side state [INF]),
   last byte `18`. Cool similar to fan with `18` at high CFM. [OBS]
 - ODU `061F` (81 B floats): a single constant payload in idle, heat,
-  and fan-only (160 reads / 161 answers in segments 01/02/06, the
+  and fan-only (177 reads / 161 answers in segments 01/02/06 — reads without answers included; the
   except-3-frames detail stands);
   during cool, 62 distinct payloads in 72 reads — compressor floats go
   live. Corpus-wide the varying offsets are exactly {17–20, 30–33, 41,
@@ -668,3 +668,7 @@ the 83,752-frame corpus, gofinity .bin, flat.bin):
   1232 → 1760 → 1710 → 1660; B-7 byte range 70–194 (§(b) and G4);
   G8 range floor 378 (E-9's "379–1760" above superseded); §(a)
   architecture note on the furnace's power-up 44→45 broadcasts.
+- V-10 (round-3 recount, 2026-11-26): §(a) `0303` polls 1,314 → 1,316
+  (V-8's figure superseded); §(e) `061F` reads 160 → 177 (161 answers
+  unchanged); the 0305 census of 677 includes 3 SystemInit-persona
+  frames — 674 are 0x20 steady-state writes.

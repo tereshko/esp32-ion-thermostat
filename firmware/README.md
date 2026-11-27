@@ -43,3 +43,26 @@ Home Assistant package. Background and protocol details:
 - Sensor steering never writes on stale sensor data (>15 min).
 - The dead-man return is off by default; arm it only after the
   heartbeat automation runs reliably.
+
+## Standing safety warning (read before touching the config)
+
+The write-core's eight guards live in **one** hub function
+(`write_comfort_bytes_()`). The vendored hub also contains 13 stock
+upstream setters that write the SAM tables with **no** guards, and
+the console component contains ~250 lines of compiled-but-disabled
+stock write verbs. In the shipped config all of them are
+unreachable — but that unreachability is a property of **this
+YAML**, not of the code. Therefore, permanently:
+
+- never add a `climate:` block (the stock one is what caused the
+  2026-11-24 incident — see `docs/firmware-history/PHASE5.md` §1);
+- never remove the early `return` that disables `!` lines in the
+  `sam_ascii` component;
+- never call hub setters (`set_zone_*`, `set_system_mode`,
+  `apply_activity`, `command_setpoint_half`, …) from YAML lambdas —
+  every write goes through `write_activity_*` / the write-core.
+
+The ten setpoint numbers carry explicit `object_id:` pins so their
+Home Assistant entity ids (`number.diy_thermostat_manual_heat_setpoint`
+etc.) are deterministic and do not depend on how the "°F" in their
+names would be sanitised.

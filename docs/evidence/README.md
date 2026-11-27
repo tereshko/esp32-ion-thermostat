@@ -6,7 +6,7 @@ serial numbers masked). Raw JSONL captures are not redistributed; the
 counts below are reproducible from the same files.
 
 - [`corpus.md`](corpus.md) — the capture inventory: every file, frame
-  counts, spans, top talkers. 83,758 frames across the main files.
+  counts, spans, top talkers. 83,752 frames across the main files.
 - [`capture-index.md`](capture-index.md) — the session-by-session index
   of what was done at the wall during each capture and what it proved.
 - [`boot-commissioning.md`](boot-commissioning.md) — cold start: the

@@ -36,9 +36,14 @@ below.
   schedule, boot, served tables and the complete control law were extracted
   from the thermostat firmware image and re-derived from primary artifacts
   in a 20-way independent verification pass.
-- **Working today:** an ESP32 node on the bus as a SAM (0x92) — telemetry
-  into Home Assistant and proven setpoint control via the 400A comfort
-  table. One unified firmware: `firmware/thermostat.yaml`.
+- **Working today (honest status, 2026-11-26):** setpoint control via
+  the 400A comfort table is proven live (phase 3, in service
+  2026-11-03 → 2026-11-24). The node is currently **off the bus** —
+  disconnected after the 2026-11-24 power incident and running on
+  USB — and the unified firmware (`firmware/thermostat.yaml`) is
+  written but **not yet compiled or flashed**. Returning to the bus
+  is gated on the power-supply decision; full status, decisions and
+  the plan: [`docs/STATUS-AND-PLAN.md`](docs/STATUS-AND-PLAN.md).
 - **Next:** a shadow (mirror) node on ESP32-S3 that runs the full control
   law in parallel with the stock thermostat, logs divergences, and takes
   over only if the stock control goes silent (measured safe window:
@@ -81,11 +86,27 @@ or AI — can go from zero to full context without asking anything:
    artifacts, CONFIRMED / REFUTED per claim.
 7. **[`docs/research/`](docs/research/)** — external sources: the
    SAM01-01XA ASCII spec analysis, infinitive register layouts, the
-   gofinity boot-capture cross-check, Clarinox stack notes, sweeps.
+   gofinity boot-capture cross-check, Clarinox stack notes, sweeps,
+   and the open upstream thread (nebulous/infinitesp#61).
 8. **[`docs/firmware-history/`](docs/firmware-history/)** — the
    build-by-build write-ups of the node firmware (what each iteration
    changed and why), the mode-experiment plan and the bench-test
    notes. The code itself is unified — see `firmware/`.
+
+**Project state, hardware, panel**
+
+- **[`docs/STATUS-AND-PLAN.md`](docs/STATUS-AND-PLAN.md)** — where the
+  project actually stands, the decision log, and the 10-step plan to
+  replace the stock control.
+- **[`docs/HARDWARE-AND-POWER.md`](docs/HARDWARE-AND-POWER.md)** — the
+  full parts inventory and the power-supply design space, including
+  the isolation rule learned from the 2026-11-24 incident.
+- **[`docs/PANEL.md`](docs/PANEL.md)** — the wall-panel build (ESP32-S3
+  + display): hardware, UI specification, owner decisions. (Currently
+  in Russian.)
+- **[`docs/ENTITY-INDEX.md`](docs/ENTITY-INDEX.md)** — the file-level
+  index: core config, entity ids, helper/automation logic, what the
+  node serves as a SAM, the console surface.
 
 ## Repository layout
 

@@ -122,12 +122,20 @@ automations are wired to it in the yaml. Inert.
 | # | Path | Verdict |
 |---|---|---|
 | T1 | Fast poll: READ 3B02/3B03 to 0x20, alternating, every 3 s, idle-gated, suppressed during retransmit iterations and discovery holdoff | safe (reads) |
-| T2 | Slow poll: one table per 31 s tick, rotating over 400A + {0104, 3B04, 4012, 4202, 3B05, 3D02, 4608, 4609, 460A} (a full rotation ≈ 4 min 40 s — the cadence PHASE3-CONTROL quotes). Comfort rows ride first in the rotation: zone 1's 400A is read on the first tick after the poll engine starts, then once per full rotation | safe (reads) |
+| T2 | Slow poll: one table per 31 s tick, rotating over 400A + {0104, 3B04, 4012, 4202, 3B05, 3D02, 4608, 4609, 460A}. Comfort rows ride first in the rotation: zone 1's 400A is read on the first tick after the poll engine starts, then once per full rotation. A full rotation is 31 s × surviving candidates — ≈5 min 10 s with the full set, ≈4 min 40 s with one target dropped (PHASE3-CONTROL's figure is the same rotation with its set). The rotation is adaptive: a target with 5 consecutive unanswered reads (discovery: 3), or a single func-0x15 refusal, is dropped for the session | safe (reads) |
 | T3 | ODU slow poll: every 31 s {0304, 3E01, 3E02, 3E08} | safe (reads) |
 | T4 | Discovery probes from 0x93 every 3.5 s (READ tabledef 0xNN01 of observed devices) | safe (reads) |
 | T5 | SAM emulation replies/exceptions to thermostat requests addressed to 0x92; store + ACK-echo for writes addressed to 0x92 | safe by design (reactive; this is what a real SAM does; on this Ion the thermostat essentially only answers our polls) |
 | T6 | Metric-units probe poll — only when SAM is disabled | n/a (not this build) |
 | T7 | bus_jsonl TCP 2373 stream | safe (output-only; client input is consumed and discarded in code) |
+
+Note (code-verified, round 3): the 180 s commissioning holdoff after
+the last 0x1F frame pauses **all** initiated traffic — polls,
+discovery **and queued writes**. A 400A write can therefore
+legitimately sit queued for up to ~3 min around a thermostat
+commissioning; that is the benign direction (more silence), but it
+is not stated in §2's guard list because it lives in the hub's TX
+drain, not in the write-core.
 
 Polling is not free — T1–T4 are the node's constant bus presence
 and the reason its SAM-mode CRC-fail rate is nonzero — but reads
@@ -333,7 +341,9 @@ guarantee); this Ion serves none (§1.3). Phase 5 computes
 `clamp(round(err), −6..+6)` relative to the **stored** byte.
 As the room converges, err → 0 and the desired byte → the
 stored byte, so steering settles by construction (plus the
-±0.7 °F settled deadband, as before). Direction comes from
+settled deadband ±0.5 °F in effect — the move is round(err) whole
+degrees, so |err| ≤ 0.5 produces no step; an earlier draft's "±0.7"
+was the design target, the rounding is the real band). Direction comes from
 live passive state: compressor running (ODU 0604 actual RPM,
 the same decode as the stock Compressor Running sensor) →
 steer cool; else room < target − 0.3 → steer heat; else room
@@ -592,7 +602,7 @@ instead:
   profile).
 - **Steering's feedback form** is new control logic (phase 4's
   gradient form never ran). Its bounds are conservative
-  (±6 °F per tick around the stored byte, ±0.7 °F settled
+  (±6 °F per tick around the stored byte, ±0.5 °F settled
   band, episode/coast machine unchanged), but the first
   episodes should be watched in the log (§5e).
 - **Heat-call detection** for steering/circulation is an

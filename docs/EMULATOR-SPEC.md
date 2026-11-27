@@ -73,8 +73,8 @@ Every ~10 s (median 10.00 s, range 9.0–11.2) the thermostat refreshes
 setpoint changes take effect by the *next* burst carrying new values.
 [Map (a), Y §7]
 
-To furnace 0x44 (internal spacing: `0305` → +41 ms `0403` → +45 ms `0409`
-→ +45 ms `0307`) [U B7; N timeline]:
+To furnace 0x44 (internal spacing ≈45 ms per member: `0305`, `0403`,
+`0409`, `0307`) [U B7; N timeline]:
 
 | Reg | Len | Idle payload | Content |
 |---|---|---|---|
@@ -83,15 +83,17 @@ To furnace 0x44 (internal spacing: `0305` → +41 ms `0403` → +45 ms `0409`
 | `0409` | 4 | `00010000` | constant; replay verbatim |
 | `0307` | 4 | `00000000` | constant write (distinct from the 3 B `0307` read answer) |
 
-To ODU 0x53 (every burst, in **all** modes, heat and fan-only included): [T §4]
+To ODU 0x53 (every burst, in **all** modes, heat and fan-only included;
+wire order as written — this group follows the furnace group by
+≈5.7 s): [T §4]
 
 | Reg | Len | Idle payload | Content |
 |---|---|---|---|
-| `0605` | 7 | `00000000000001` | compressor capacity command (§6.1) |
-| `060D` | 1 | `00` | call-armed flag: `02` during any heat or cool call, `00` idle/fan-only (§6.2) |
 | `0610` | 4 | `00000000` | constant; replay verbatim |
 | `0612` | 10 | `22B80000000000000000` | constant; replay verbatim |
+| `0605` | 7 | `00000000000001` | compressor capacity command (§6.1) |
 | `061A` | 1 | `01` | constant; replay verbatim |
+| `060D` | 1 | `00` | call-armed flag: `02` during any heat or cool call, `00` idle/fan-only (§6.2) |
 | `061E` | 9 | `0F3FD851EC06000000` | coil-parameter frame (§6.3) |
 
 ### 1.4 Timing tolerances
@@ -175,8 +177,8 @@ The wire CRC is computed by `FUN_180a42dc` [AA §1]:
   byte (receiver validates over `buffer, count − 2`). [AA §5]
 - Verification status: the routine equals the standard reflected-A001 CRC
   on 2000/2000 random buffers and 1532/1532 gofinity wire frames,
-  and it reproduces the checksum field of 101,352 frame bodies
-  reconstructed from this installation's captures. Wire-level
+  and is self-consistent with the standard form on 101,352 frame
+  bodies reconstructed from this installation's captures. Wire-level
   verification on the installation's own captures is impossible —
   the JSONL corpus stores no CRC bytes — and the verification corpus
   rules that half UNVERIFIABLE (verification/VERIFY-crc.md); the
@@ -207,7 +209,6 @@ DIR-B records **for this installation's device classes** (canonicalizer:
 | `0307` | 0x40 | 4 | 0xFFF85841 |
 | `0605` | 0x52 | 7 | 0xFFF85C8D |
 | `060D` | 0x52 | 1 | 0xFFF85CCE |
-
 | `061E` | 0x52 | 9 | 0xFFF85D44 |
 | `3E02` | 0x0E | 1 | (boot broadcast only, §3.2) |
 
@@ -288,8 +289,12 @@ capture it began after 78.23 s of total 0x20 silence. [U B1]
 
 ### B2 — The 0x1F sweep (≈ +6 … +16.7 s)
 
-Cadence ~95 ms per probe. Retry rule: **unanswered → sent exactly twice;
-answered → sent once** and the device is registered. [U B2, Map (c)]
+Cadence ~95 ms per probe. Retry rule: **unanswered → sent twice**
+(the dominant pattern — 34 of 43 unanswered targets; the
+zone/damper-class addresses 46/5A/5C receive a second double-pass,
+×4, and two targets were sent once; VERIFY-boot refuted "exactly
+twice" as a universal rule); **answered → sent once** and the device
+is registered. [U B2, Map (c)]
 
 Probe programme (order as captured; the emulator needs the same coverage
 for its device registry — the registry is RAM-only and rebuilt every
@@ -319,7 +324,9 @@ routing). [U B2, §3.1]
 
 **Do not probe 0x0E.** This Ion never touches 0x0E in 101,352 captured
 frames; 0x0E is a reserved discovery slot for a 3E-family two-capacity
-ODU on other systems. Omit the hunt entirely. [U §2]
+ODU on other systems. Omit the 0x0E hunt entirely (the 0x58
+3E-family hunt in the B2 programme above is this unit's own and
+stays). [U §2]
 
 ### B3 — Persona handoff 1F → 20 (t ≈ +16.7 s)
 
@@ -407,7 +414,7 @@ storage) [U §3.2, P §1]:
 - offset 0x9A — coil catalogue index; offsets 0x59F / 0x1C7C–0x1C7E —
   committed coil parameter set
 - offsets 0x1BC–0x1C3 — furnace config mirror (from `0316`; refreshed
-  from the bus, but stored)
+  from the bus, but stored) (firmware-side claim: captures show the `0316` read, not where the values land — UNVERIFIABLE from captures, VERIFY-boot claim 8)
 - all user/dealer settings: profiles and setpoints (the `400A` rows),
   dictionary settings (lockouts, latch, staging limits…), dealer info
 - descriptor defaults for any field never set (factory defaults;
@@ -472,6 +479,7 @@ thermostat's reads and are per-device (0302: ODU 24 B / furnace 12 B;
 what 0x20 serves. For serving, the **DIR-C sizes govern**; `3B02`'s
 DIR-C/DIR-A member binds store buffer 0x3C0D8D7D with
 length 29, matching the wire exactly [AA §7, Audit-2 E-18].
+Serve-set policy: the table above is the wire-attested serve set plus `0302` (DIR-C). The remaining DIR-C entries (`0303`, `0304`, `0307`, `061E`) are code-derived serve images with no observed external reader; an emulator serves them at DIR-C sizes if read.
 
 Not every read is answered even by Ion: in the SAM captures ≈4 % of
 `3B02`/`3B03` polls were silently dropped (79/1,811 corpus-wide;
@@ -517,9 +525,11 @@ reseat it emitted zero `040E`/`3F02` probes, zero `031C` writes to a SAM,
 and zero steady-state polls to 0x92. The emulator must reproduce exactly
 this relationship [V §1.1, §2, §3]:
 
-**Serve:** the §4.1 read surface, to any reader (the same surface is
-served to 0x93 — the zero content of `3B02`/`3B03` is the tables'
-content on this unit, not SAM-specific addressing). [V §1.1]
+**Serve:** the §4.1 read surface, to any reader. (In the corpus
+0x93 only ever read `3B05`; whether it would be served the rest is
+unobserved — VERIFY-sam marks that half UNVERIFIABLE. The zero
+content of `3B02`/`3B03` is the tables' content on this unit, not
+SAM-specific addressing.) [V §1.1]
 
 **Never do:**
 
@@ -915,12 +925,16 @@ quantizer of the demand differential: bands at **+5 / 0 / −5**, ±1
 deadband; CD4B ∈ {1, 2, 3, 4}; preset to 4 by ingestion.
 
 **Cool-side staging machine → CD49** [E via S §3, §7; Y §4.3]:
-`FUN_180c54d8`, gated on **CD7D == 2 (COOL)**, thresholds over
-`CCC4[CC5A]`, output CD49 ∈ {0, 1, 2}:
+`FUN_180c54d8`, gated on **CD7D == 2 (COOL)**, output CD49 ∈ {0, 1, 2}.
+The threshold bases differ by transition (VERIFY-staging): stage-2
+engage and fallback read `CCC4[CC5A−1]`, stage-1 engage and drop read
+`CCC4[1]` (for this installation CC5A = 2, so both bases are the same
+cell, `CCC4[1]`):
 
-- stage 2 when demand > **×1.25** of the selected threshold;
-- stage 1 engages at **×0.25** of T[1], held until demand < **×0.01**;
-- stage 2 falls back at **×1.00**.
+- stage 2 when demand > **×1.25** of `CCC4[CC5A−1]`;
+- stage 1 engages at **×0.25** of `CCC4[1]`, held until demand <
+  **×0.01** of `CCC4[1]`;
+- stage 2 falls back at **×1.00** of `CCC4[CC5A−1]`.
 - **No timers** — pure demand hysteresis. The hysteresis form is proven
   and was emulator-verified 12/12 by stage M (on this machine).
   [Audit-2 §1(b)]
@@ -1086,7 +1100,9 @@ above. [Map (b), (e)]
 
 ### 6.1 The burst to 0x53 (normative, every burst, all modes)
 
-Write, in this order: `0605`, `060D`, `0610`, `0612`, `061A`, `061E`.
+Write, in this order (wire-measured in two captures, no exceptions;
+the group is the burst's second sub-burst, ≈5.7 s after the furnace
+group): `0610`, `0612`, `0605`, `061A`, `060D`, `061E`.
 Idle values (the constants the thermostat sends when nothing calls):
 `0605 = 00000000000001`, `060D = 00`, `0610 = 00000000`,
 `0612 = 22B80000000000000000`, `061A = 01`, `061E = 0F3FD851EC06000000`.
@@ -1113,8 +1129,10 @@ Only `0605` bytes [0..4] and `060D` [0] ever change. [T §11 item 1]
   archive proves they occur. [T §11 item 5]
 - Byte [4] (call flag): 1 while a cool call is commanded **and for ≈3
   min (18 bursts) after the call ends**; also observed 1 in unexplained
-  windows (the first 24 bursts of one capture, in a heat-adjacent
-  context) — its writer was not isolated; the rule above is the
+  windows (27 bursts outside any call: the first 24 of one capture,
+  before its heat window opens, and 3 after a 3.0 transient in
+  another — VERIFY-cooling claim 4) — its writer was not isolated;
+  the rule above is the
   implementable form. [T §2.1, §5.3]
 
 ### 6.3 The 061E coil payload (literal construction)

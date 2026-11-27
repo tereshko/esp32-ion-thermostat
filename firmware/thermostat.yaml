@@ -313,6 +313,7 @@ number:
   - platform: template
     name: "Home Heat Setpoint °F"
     id: home_heat_setpoint
+    object_id: home_heat_setpoint
     min_value: 50
     max_value: 85
     step: 1
@@ -330,6 +331,7 @@ number:
   - platform: template
     name: "Home Cool Setpoint °F"
     id: home_cool_setpoint
+    object_id: home_cool_setpoint
     min_value: 60
     max_value: 99
     step: 1
@@ -347,6 +349,7 @@ number:
   - platform: template
     name: "Away Heat Setpoint °F"
     id: away_heat_setpoint
+    object_id: away_heat_setpoint
     min_value: 50
     max_value: 85
     step: 1
@@ -364,6 +367,7 @@ number:
   - platform: template
     name: "Away Cool Setpoint °F"
     id: away_cool_setpoint
+    object_id: away_cool_setpoint
     min_value: 60
     max_value: 99
     step: 1
@@ -381,6 +385,7 @@ number:
   - platform: template
     name: "Sleep Heat Setpoint °F"
     id: sleep_heat_setpoint
+    object_id: sleep_heat_setpoint
     min_value: 50
     max_value: 85
     step: 1
@@ -398,6 +403,7 @@ number:
   - platform: template
     name: "Sleep Cool Setpoint °F"
     id: sleep_cool_setpoint
+    object_id: sleep_cool_setpoint
     min_value: 60
     max_value: 99
     step: 1
@@ -415,6 +421,7 @@ number:
   - platform: template
     name: "Wake Heat Setpoint °F"
     id: wake_heat_setpoint
+    object_id: wake_heat_setpoint
     min_value: 50
     max_value: 85
     step: 1
@@ -432,6 +439,7 @@ number:
   - platform: template
     name: "Wake Cool Setpoint °F"
     id: wake_cool_setpoint
+    object_id: wake_cool_setpoint
     min_value: 60
     max_value: 99
     step: 1
@@ -449,6 +457,7 @@ number:
   - platform: template
     name: "Manual Heat Setpoint °F"
     id: manual_heat_setpoint
+    object_id: manual_heat_setpoint
     min_value: 50
     max_value: 85
     step: 1
@@ -466,6 +475,7 @@ number:
   - platform: template
     name: "Manual Cool Setpoint °F"
     id: manual_cool_setpoint
+    object_id: manual_cool_setpoint
     min_value: 60
     max_value: 99
     step: 1

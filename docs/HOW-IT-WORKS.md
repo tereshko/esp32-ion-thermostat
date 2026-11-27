@@ -283,6 +283,12 @@ the evidence supports:
 
 ## 11. The firmware in this repository
 
+**Status (2026-11-26):** this build is written but has **not been
+compiled or flashed yet**; the node is off the bus (see
+`docs/STATUS-AND-PLAN.md`). The last build to run live was
+phase3-control (2026-11-03 → 2026-11-24). What follows describes the
+build's design and its intended behaviour.
+
 `firmware/thermostat.yaml` (+ `firmware/components/`) is the unified
 node build; `firmware/home-assistant.yaml` is its HA package.
 
@@ -292,7 +298,8 @@ node build; `firmware/home-assistant.yaml` is its HA package.
   single guarded write-core of §6 — no climate component.
 - Sensor steering: optional BLE room sensor feedback — the stored
   manual bytes are nudged toward the room target (error = target −
-  sensor, step clamped to ±6 °F per 30 s tick, ±0.7 °F settled band),
+  sensor, step clamped to ±6 °F per 30 s tick, whole-degree steps of
+  round(error) — the loop settles within ±0.5 °F),
   inert when the sensor is stale (>15 min) — no writes without fresh
   data. (The phase-4 gradient form, which steered by the wall
   reading, is superseded: this thermostat serves no wall temperature
