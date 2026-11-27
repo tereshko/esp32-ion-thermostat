@@ -17,7 +17,7 @@ Status dates are as of 2026-11-26.
 | ESP32 DevKit (classic ESP32, CP2102 USB-UART) | The original node MCU | Runs the ESPHome node firmware: bus telemetry into Home Assistant and 400A setpoint control from the SAM slot (0x92) | Was installed at the wall from phase 1 (2026-10-29); currently disconnected from the furnace and USB-powered since the 2026-11-24 power incident (see Part 2) |
 | HW-451 carrier/shield board | Per-GPIO colour-coded pin triplets: **black row = G (ground), red row = V (power), blue row = S (signal)** | Carries the ESP32 and breaks out the wiring to the RS-485 module | Installed with the node. Root cause of the 2026-10-28 incident: all ESP-side wires landed in the black (G) row instead of blue (S), which keyed the bus — see the protocol/incident notes |
 | RS-485 module, MAX13487E | Auto-direction transceiver; A → DX+, B → DX−, module GND = bus common (C, white wire) | The node's only physical interface to the Ion bus (38400 8N1) | Installed with the node. One module is enough — a second one was considered only as a spare and is not needed; the same module moves to the panel carrier later |
-| Bus wiring at the wall | 4 wires: **DX+ green, DX− blue, C white, D red (24 VAC)**; TTL side module↔ESP: module TXD (green) → GPIO16, module RXD (yellow) → GPIO17, VCC (red) → 3V3, GND (black) | Connects the node to the furnace bus and to the C/D power pair | Verified against a wall photo 2026-10-28. TTL signal wires land **only** in the blue (S) row of the HW-451 triplets |
+| Bus wiring at the wall | 4 wires: **DX+ green, DX− blue, C white, D red (24 VAC)**; TTL side module↔ESP: module TXD (green) → GPIO16, module RXD (yellow) → GPIO17, VCC (red) → 3V3, GND (black) | Connects the node to the furnace bus and to the C/D power pair | Verified against a wall photo 2026-10-28. TTL signal wires land **only** in the blue (S) row of the HW-451 triplets. **Power the module from 3.3 V ONLY — 5 V on the TTL lines kills ESP32 GPIOs** |
 
 ### 1.2 ESP32-S3 boards (mirror node + future panel)
 
@@ -194,6 +194,16 @@ C/D 24 VAC → 1 A slow-blow fuse → bridge rectifier (KBP210 class)
   soldering") — which favours Option B's form factor but not its
   size; Option A is the datasheet-verified electrical choice and
   assembles entirely on connectors.
+- Two scope notes so the constraints are not over-generalised.
+  (1) **Isolation is not a cure for the 2026-10-28 failure mode:**
+  an isolated module does **not** protect against a stuck-low TX
+  input — isolation covers ground/bias faults only; the A–B
+  pre-flight check is the real fix. For the same reason the
+  isolated **Waveshare TTL TO RS485 (C)** purchase is **off** by
+  the owner's decision: it would have failed identically.
+  (2) **The no-soldering constraint applies to the power chain
+  only.** The panel and audio boards the owner solders himself;
+  the boundary is per-track, not a blanket rule.
 - The node remains **fully disconnected from the furnace and powered
   over USB**. The furnace runs autonomously from the Ion wall
   control; Home Assistant control is paused.

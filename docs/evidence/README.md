@@ -35,4 +35,7 @@ Scenarios were captured in a fixed priority order — cold boot first
 ramp, and mode/setpoint changes. **Faults were never induced on
 purpose**; when a real fault occurred, the log was kept and marked.
 Operator actions and times belong in each session's annotations —
-in this corpus the session index above carries them.
+in this corpus the session index above carries them. Coverage
+status: the only scenarios **not** captured are a long stage-2
+heat soak and a full inverter ramp from a warm ambient — both are
+opportunistic captures, not blockers for anything in this repo.

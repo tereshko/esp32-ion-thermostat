@@ -62,3 +62,15 @@ The decisive bench test: DC across A–B at rest (≈1.5–3 V means the
 module is keying the bus), then remove the module's RXD (yellow)
 wire. The retry rules and the A–B ≈ 0 V pre-flight in
 `../../HARDWARE-AND-POWER.md` §2.5 come from this incident.
+
+## The owner's original control spec — superseded
+
+The feature spec this project started from (owner's wording,
+2026-10) was a **1 °F band everywhere**: heat call ON at control
+temperature ≤ target − 0.5 °F, OFF at ≥ target; cooling mirrored;
+implemented as a two-state controller in Home Assistant driving
+the SAM setpoint with ±2 °F offsets, with min-run ~3–5 min and
+min-off 5 min guards. It died with the SAM mirror (phase 2 above):
+an unregistered SAM's setpoints move nothing. The shipped law is
+the phase-5 feedback form over the 400A manual row — see
+`PHASE5.md` and the guide §11.

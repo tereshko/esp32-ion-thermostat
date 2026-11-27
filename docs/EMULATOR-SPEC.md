@@ -369,7 +369,10 @@ sourcing frames from 0x20. [U B3]
 
 The indoor coil is **not learned from the bus**. It is selected at
 commissioning (dealer/wizard "Indoor Evaporator Selection") and resolved
-against the firmware's built-in coil catalogue: EN(A,D)4X61 → parameter
+against the firmware's built-in coil catalogue — notably, this catalogue
+is the **only equipment table stored in the firmware image**: the
+furnace and outdoor-unit model data are not in the image at all (both
+units self-identify over the bus, table 0104). EN(A,D)4X61 → parameter
 **1.69** (float32 0x3FD851EC), committed into the field store (fields
 0x59F / 0x1C7C / 0x1C7D / 0x1C7E; catalogue index in field 0x9A).
 Thereafter every `061E` write carries it (§6.3). **Emulator rule: persist

@@ -290,7 +290,11 @@ build.
 - **Phase 3** was the last firmware in service (until 2026-11-24).
   **Phase 5** and **phase 6** are built and documented but **not
   compiled and not flashed**; ESPHome compilation happens on the
-  owner's machine and is the first gate for both.
+  owner's machine and is the first gate for both. (Operating
+  context: builds run **only** on the owner's Windows PC — the
+  assistant's environment has no ESPHome installed and no network
+  route to the home LAN, so every build's compile, flash and
+  on-bus verification happen owner-side, guided step by step.)
 - **Bus power is undecided.** Two verified-isolation options are
   on the table (decision pending since 2026-11-24):
   - a component chain — C/D → 1 A slow-blow fuse → bridge →

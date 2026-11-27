@@ -209,6 +209,14 @@ MAC addresses and flasher settings live only in the owner's
 `secrets.yaml` / flasher session — the repo carries placeholders
 by design.
 
+Bench record for sensor 1 (2026-10-27, the day the node was
+flashed with **ESPHome 2026.10.0**): 26.4 °C / 39 % RH / battery
+89 % (2.914 V). Timing subtlety: the sensor produces **fresh
+values every ~10 s** (its measure interval); advertisements run
+every 2.5 s and duplicate frames are dropped by counter — so HA
+updates land at the measure cadence, not the advertising
+cadence.
+
 ## Behavioural details a rebuilder would otherwise miss
 
 - **Bus-online timeout:** the hub considers the bus offline after
