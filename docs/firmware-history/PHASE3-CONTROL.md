@@ -99,7 +99,11 @@ stored bytes into the number states, only when they differ. Boot state:
 numbers show their `initial_value` placeholders (68/76) until the first
 poll populates the cache (row is polled ~4 min 40 s cadence) and the
 next sync tick converges them — allow ~5 min after flashing before
-judging or steering, same as the test build.
+judging or steering, same as the test build. (The ~4 min 40 s is the
+full cycle of the node's own slow-poll rotation over all its tables;
+PHASE5 §1.2 states the same rotation as a 31 s step. Not to be
+confused with the thermostat's ~3 s 3B02/3B03 polling of the node —
+different tables, opposite direction.)
 
 ### Why sync can never cause a write — the loop argument, airtight
 
