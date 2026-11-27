@@ -295,15 +295,20 @@ Design rules and how each is met:
    set_action writes once through the core, then re-publishes
    the stored byte (a refused write snaps back visibly). A 45 s
    interval publishes stored bytes into all ten — publish-only
-   (see the loop proof, §6 check 2). **Boot state:** the numbers
-   are never restored from Home Assistant (`restore_value: false`
-   throughout) — after a reboot they show placeholders until the
+   (see the loop proof, §6 check 2). **Boot state:** the ten
+   setpoint numbers are never restored from Home Assistant
+   (`restore_value: false`) — after a reboot they show placeholders
+   until the
    first 400A read populates the cache (400A rides the first T2
    rotation slot — first read within ~31 s of the poll engine
    starting; allow ≈5 min after flashing for full convergence, as
    in phase 3) and the 45 s sync converges them to the wall's
    stored bytes; a set_action against an unpopulated cache is
-   refused by the freshness guard (rule 2). Same behaviour as
+   refused by the freshness guard (rule 2). (Scope note: the
+   `restore_value: false` rule covers the ten setpoint numbers; the
+   steering/settings numbers and "Dead-man Hours" deliberately use
+   `restore_value: true` — they are owner settings, not wall state.)
+   Same behaviour as
    phase 3 (PHASE3-CONTROL, read-back sync). Editing a profile row
    changes the wall's **stored** profile; which profile is
    active remains the wall's business, and profiles stay fully

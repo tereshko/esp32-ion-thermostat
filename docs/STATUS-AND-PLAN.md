@@ -96,9 +96,11 @@ ESP32 node and Home Assistant alongside.
   temperature rise → alert, then full Off, manual reset only);
   eco+ — no; music — no; VOC sensor — not buying; the panel must
   work autonomously without Home Assistant.
-- All panel parts were ordered 2026-11-17/18 (3.5″ ST7796U+FT6336U
-  display, TSL2591, SHT40, LD2410C, SPH0645 microphone, MAX98357A,
-  speakers, sockets/terminals/wire, second LYWSD03MMC).
+- The panel parts set was ordered on the night of **2026-11-12**
+  (3.5″ ST7796U+FT6336U display, TSL2591, SHT40, LD2410C, SPH0645
+  microphone, MAX98357A, speakers, sockets/terminals/wire, second
+  LYWSD03MMC); only the carrier bits and the S3 boards followed on
+  2026-11-17/18.
 - Platform decision: **ESP32-S3 N16R8** (the P4 option was closed);
   two GlobalGo ESP32-S3-DevKitC-1 N16R8 boards were ordered
   2026-11-18 and **delivered by 2026-11-26** (see §3).
@@ -264,7 +266,8 @@ permanent mirror.** The owner approved the replacement plan on
 immediately; takeover is additionally gated by an explicit enable
 switch in Home Assistant, with alerts in both directions; the
 takeover threshold must sit **between Ion's recovery time and the
-furnace comm-fault timeout** — both numbers to be measured (T-1),
+furnace comm-fault timeout** — the two numbers are measured by
+tests T-1 (comm-fault timeout) and T-2 (Ion recovery time),
 with the window already bounded below (> ~36 s of tolerated
 silence, from the reseat capture) and above (~2 min to ODU
 standby).
@@ -325,7 +328,9 @@ build.
 
 Approved 2026-11-26. Steps 1–4 are measurements and captures;
 5–7 build the emulator in shadow; 8–10 take it live. The failover
-design constraints of D8 apply to every step from 6 on.
+design constraints of D8 apply to every step from 6 on. The owner's
+sequencing across tracks: **power and a real bus on/off (the mode
+byte) first, then voice, then the panel**.
 
 | # | Step | Criterion / what it produces |
 |---|---|---|

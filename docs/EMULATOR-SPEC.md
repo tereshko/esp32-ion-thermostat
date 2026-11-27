@@ -611,7 +611,8 @@ detailed state `AE45` ∈ {1..5}:
 - `R` effect: 0 → demand decides (arbiter + changeover tests below);
   1 → force HEAT states; 2 → force COOL states; 3 or 4 → park at (3,1),
   no direction. Crossing to the opposite direction passes through (3,1)
-  when the equipment word has bit 0x20 set and family ≠ 0x800. [S §2, §4]
+  when the equipment word AE50 has bit 0x20 set and the masked
+  family field (AE50 & 0x7C00) ≠ 0x800. [S §2, §4]
 - **Changeover delay:** on several transitions the machine arms a timer
   of `field 0x1B` minutes × 60 s (field 0x1B is a field-store byte).
   [S §1a, §2]
@@ -630,7 +631,7 @@ Implementable summary [S §9]:
 User mode   R   CD7D   AE45        Notes
 AUTO        0   3      1 ⇄ 3/5     arbiter + 0.5 °F changeover tests; delay = field 0x1B min
 HEAT        1   1      2 ⇄ 3       demand: max(HSP) + 0.75 − T
-COOL        2   2      4 ⇄ 5       demand: T − (min(CSP) − 0.75); staging §5.4; arbitration §5.5
+COOL        2   2      4 ⇄ 5       demand: T − (min(CSP) − 0.75); staging §5.5; arbitration §5.5
 FAN ONLY    3   3      1 (parked)  no direction, no demand   [INF: R=3 identity]
 OFF         4   3      1 (parked)  no direction, no demand   [INF: R=4 identity]
 ```
@@ -703,7 +704,9 @@ constant — earlier "1.325" readings were a misread of its high word);
 
 A second writer (`FUN_180c4322`, `CD44 := param` verbatim) exists but is
 a binding-property pass-through selected only for a normalised argument
-in (0.1, 1.0] with `CD4A ∉ {1,2,3}`; it is **not** part of the
+in (0.1, 1.0] with `CD4A ∉ {1,2,3}` (plus two state preconditions — a
+pointer-pair ordering and a nonzero dictionary byte at 0x3C12A852
+[VERIFY-demand item 8]); it is **not** part of the
 refresh-cycle law. The emulator implements writer 1 only. [O §5]
 
 #### The ceiling C870 [O §3]
@@ -768,7 +771,7 @@ Configuration values for all of these are **data, not code** — §9.
 
 The demand law consumes breakpoint tables built at ingestion by two
 producers. Table axes are demanded capacity on a nominal-capacity scale:
-12000.0 = BTU/h per ton; 34.286 = 12000/350 (the nominal 350 CFM/ton air
+12000.0 = BTU/h per ton; 34.286 ≈ 12000/350 (the nominal 350 CFM/ton air
 volume). For this ODU, R = 5 ↔ 60K BTU/h. [Q §4, INF strong]
 
 **Producer 1 — `FUN_181f21d4`** builds `CCC4` (mode-2/cool table),
@@ -798,7 +801,10 @@ from the equipment class word **CC52** (field-store bytes [1..2]),
   (0xC195/0xC295) parse a 125-byte blob from the ODU's own `060E` object
   (device class 0x52). Full branch tables: [P §2.3–§2.6].
 - Selector form: four dictionary ushorts (table `0504`, class 0x50 or
-  0x54) scaled by 1/1000, min-clamped at 0.0001; a selector byte
+  0x54) scaled by 1/1000; the 0.0001 floor is a **replacement**, not
+  a clamp — a second-pair value below 0.0001 is replaced by the
+  corresponding first-pair value (`C76C < 0.0001 → C76C = C774`;
+  `C770 < 0.0001 → C770 = C778`) [P §2.4]; a selector byte
   (0xFFF8C74D for CCC4, 0xFFF8C74E for CCDC) picks the (first, second)
   pair — selector ∈ {1, 0} → pair 2, any other value → pair 1;
   `table[1] = R × scale × first`, `table[2] = R × scale × second`
@@ -824,7 +830,9 @@ are not in the image and are not needed. [P §6.2, §6.3]
 (field-store bytes [3..4]); count `CBFA = (CBF4 & 3) + 1`. Gate: CBF4 ==
 0 or mirror byte CBF6 ∈ {0, 4} → no tables written. Branches copy
 ushort parameters from table `0402` (classes 0x3E/0x40/0x42) into
-CC04/CC1C identically, and build CC34 from a byte of table `030A` ×
+CC04/CC1C identically — **except classes 0x97/0x197/0x5B, which
+  write CC04 only (CC1C[2..3] stay 0)** [P §3] — and build CC34 from
+  a byte of table `030A` ×
 1000.0 with 0.4/0.6/1.0 tapering; special classes: 0x59/0x5B use
 store[0x12] × 3414.0 (with the 6×3 lookup table @0x1830B094: keys
 9/15/18/20/24/30 → fractions 1/3, 2/3 or 1/4, 3/4); 0x39 is a
@@ -864,8 +872,10 @@ the refresh [Q §3]:
 3. **Channel 1 (spillover):** in **heat**, CD44 is first capped at
    CCDC's last entry, and the **excess over the heat table's maximum**
    is latched: `0x3C12A844 := max(0x3C12A844, max(0, CD44 −
-   CCDC[CC5A−1]))` (gated on class bits CC52 & 0x100, family == 0x400,
-   and flag bytes); channel 1's input is that excess (without the gate,
+   CCDC[CC5A−1]))` (gated on class bits CC52 & 0x100, (CC52 &
+   0x7C00) == 0x400, and the flag set CD7C≠0, CD7D==1, CC54≠3, CBF4
+   bits 0x40/0x20, with the C5B6 gate [Q §3]); channel 1's input is
+   that excess (without the gate,
    CD44 itself). Channel 1 inverse-interpolates its input over **CC34**
    (count CBFA). The latch resets when CD44 falls below a half-segment
    threshold (0x3C12A84C = active segment endpoint / 2).
@@ -885,14 +895,18 @@ ingestion path [Q §3]:
   the pre-refresh value the demand law's share term reads).
 
 **Coordinate clamping:** every write through either setter passes the
-equipment-dependent clamp dispatcher `FUN_181f4d04`, which merges the
+equipment-dependent clamp dispatcher `FUN_181f4d04` — which acts
+**only when its record predicate passes** (`record[6]==4 &&
+record[0]∈{3,4} && record[5]==2`); otherwise the `record[0]==4`
+fallback applies (2.0 clamp, band <31 only) [VERIFY-coordinates
+claim 2]. The dispatcher merges the
 flash equipment-record template @0x1830B0A8 with the live record and
 dispatches on mode, class-word bit 0x20, and the equipment size byte
 (record[0x10], bands <31 / 31–60 / ≥61) [Q §1, labels corrected]:
 
 | Mode | bit 0x20 | Clamp applied |
 |---|---|---|
-| heat (==1) | set | two-value clamp into the band set {0.0, 1.0, 1.3 if record[0]==4 else 1.4}; **≥61 → v := 0.0** (the heat chain `FUN_181f48de` forces 0.0 at size ≥61 independently — verification addendum 2026-11-26) |
+| heat (==1) | set | two-value clamp by band: <31 → {1.3 if record[0]==4 else 1.4}; 31–60 → 1.0; **≥61 → v := 0.0** (the heat chain `FUN_181f48de` forces 0.0 at size ≥61 independently — verification addendum 2026-11-26) |
 | heat (==1) | clear | if size <31 and v ≥ 2.0 → v := 2.0 |
 | cool (==2) | set | size <31 → v := min(v, 1.3/1.4); 31–60 → v := min(v, 1.0); **≥61 → v := 0.0** (the size derate applies in **both** mode chains, contra the cool-only reading) |
 | cool (==2) | clear | if size <31 and v ≥ 2.0 → v := 2.0 |
@@ -932,9 +946,10 @@ engage and fallback read `CCC4[CC5A−1]`, stage-1 engage and drop read
 cell, `CCC4[1]`):
 
 - stage 2 when demand > **×1.25** of `CCC4[CC5A−1]`;
-- stage 1 engages at **×0.25** of `CCC4[1]`, held until demand <
-  **×0.01** of `CCC4[1]`;
-- stage 2 falls back at **×1.00** of `CCC4[CC5A−1]`.
+- stage 1 engages at **×0.25** of `CCC4[1]`, held until demand ≤
+  **×0.01** of `CCC4[1]` (drop at ≤, not <);
+- stage 2 falls back at **×1.00** of `CCC4[CC5A−1]`, and drops
+  **directly to 0** at demand ≤ ×0.01 of `CCC4[1]`.
 - **No timers** — pure demand hysteresis. The hysteresis form is proven
   and was emulator-verified 12/12 by stage M (on this machine).
   [Audit-2 §1(b)]
@@ -973,7 +988,8 @@ the names. For this installation only the plain cooling path is
 reachable in cool, and CD4A ≡ 0 in heat. [S §7, T §6]
 
 **Other isolated control behaviours** [Y §4.3]: satisfaction hysteresis
-— a zone-satisfaction average sets a flag at > 2.5, clears at < 1.5
+— a zone-satisfaction average **clears** the flag cell
+  (0x3C12E6C4 := 0) at > 2.5 and **sets** it (:= 1) at < 1.5
 (`FUN_18183d34`); demand-response trim — flagged zones give up half of a
 system offset D = clamp(x, 0…6 °F), adjusted setpoint capped at 70.0 °F
 (`FUN_180c55f2`; optional layer, DR events only).
@@ -997,13 +1013,15 @@ capacity coordinate (generic interpolation over segment [lo, hi]:
   the shared coordinate cell 0x3C12EC6C. Base = part 1 + part 2.
 - **Cool** (`FUN_1804f6cc`): main (gate CC52 & 0x20, input inside
   [CA75, CA76]) = interp over **CC7C** (CD43 ≠ 0) else **CC64**. Detour:
-  in the CD43 ≠ 0 branch with selector byte C74D == 1, `FUN_18051898`
+  in the CD43 ≠ 0 branch with selector byte C74D == 1 **and
+  CB4D == 0**, `FUN_18051898`
   runs — if `(CC52 & 0xF) == 1` it calls `FUN_18051cec(CD4A)`, the getter
   whose constant run is {200, 275, 375, 325, 400, 350} with first-level
   selection by CD4B (windows {375, 325, 400, 350} / {400, 350, …}) —
   **375/400 are live CFM/ton constants on this path, not dead code**
-  [Audit-2 §1(e)]; else it interpolates `max(0x3C12EC6C − 1.0, 0)`
-  through the two-point getter `FUN_18051908`. Both primary candidate
+  [Audit-2 §1(e)]; else it interpolates through the two-point getter
+  `FUN_18051908(f, CD4A)` with `f = max(0x3C12EC6C − 1.0, 0)` (class
+  field 0x4000 variant: `f = (X − 1) / 4.0` — not this family). Both primary candidate
   class words (0x8141/0x91C1, low nibble 1) satisfy the `(CC52 & 0xF)
   == 1` gate. [R §2.2, Audit-2 §1(e)]
 - Equipment family field `(CC52 & 0x7C00) == 0x800` replaces the result
@@ -1020,12 +1038,14 @@ flash parameter family {200, 325, 350, 0.85, 1.0} and `FUN_18086898`
 clamps against the engine limit cell 0xFFF80F9C. (The exact
 variant-return ABI of `FUN_1805002a` is unresolved; functionally it is a
 class-dependent minimum-airflow selection applied as a raise.) [R §2.3]
-Class-0x4000 equipment with a zero flag byte forces base = 0.0 instead —
-not our family. [R §1.1]
+Class-0x4000 equipment — `(CC52 & 0x7C00) == 0x4000` with
+0xFFF806A4 == 0 and CD87 == 0 — forces CD88 = 0.0 instead; not our
+family. [R §1.1, §1.2]
 
 **Step 4 — write:** `FUN_1804fa1c`: CD88 := base, plus the per-zone
 split `CD9C[i] = CD88 × CD1C[i]` (and `CDBC[i] = CD8C × CD1C[i]`).
-[R §2.4]
+Inactive zones (`FUN_181f035c(i) == 0`) get CD9C[i] = CDBC[i] = 0;
+zones with CBA9[i] == 4 accumulate into CDDC[i] instead. [R §2.4]
 
 **Step 5 — demand floor + store clamps** (second half; runs when any of
 CD86/CD87/CB55/CB56 ≠ 0) [R §1.2]:
@@ -1033,7 +1053,8 @@ CD86/CD87/CB55/CB56 ≠ 0) [R §1.2]:
 ```
 floor = FUN_1804fca0() = max( C74F ? C750 : 300 , 175 )
         ; C74F = selector byte; C750 = configured ushort; 300 and 175 are flash constants
-demandFloor = 325 × CD8C / 12000.0
+demandFloor = 325 × CD8C / 12000.0   ; the term is truncated to a
+        ushort ((uint)(...) & 0xFFFF) before the comparison [VERIFY-cfm]
 if (C9F0 ≠ 0) floor = max(floor, demandFloor)
 if (CD88 < floor) CD88 = floor          ; ratchet up only
 if (CD7D == 1) CD88 = clamp(CD88, store[197], store[199])    ; heat floor, cap
@@ -1120,7 +1141,8 @@ Only `0605` bytes [0..4] and `060D` [0] ever change. [T §11 item 1]
   them with [4]=1, only 18 of those being the cool-call tail); 34 bursts at **5.0** (the one
   captured call — setpoint 70 °F, OAT ≈ 65 °F, ≈6 min, ended by wall OFF,
   never satisfied); exactly **one** frame at 3.0 (2026-11-03, transition
-  transient, ~10 s after heat ended).
+  transient — 15 s after the last heat-demand 0305, 5 s after the
+  all-zero demand write).
 - **v1 law (implement this):** during a cool call write **5.0** for the
   whole call, from the first demand burst; at call end drop to **0.0**
   in one step. Do **not** emit intermediate values (1.0–4.0) until
@@ -1159,8 +1181,9 @@ hard-code a different coil's bytes. [T §2.2, §11 item 6]
 
 ### 6.5 ODU self-behaviour (context, not thermostat control)
 
-Under a constant 5.0 the ODU ramps itself (target RPM 2180 → 2850 →
-3700 → 4140, current chasing); the EXV read 45 % in the first in-call
+Under a constant 5.0 the ODU ramps itself (target RPM steps 2180 →
+2850, touches 4140, dips to 3700, back to 4140 — not monotonic;
+current chasing); the EXV read 45 % in the first in-call
 `0608` sample and 100 % in the other 65 of 66 in-window samples; its `0608` requested CFM (938 → 1600) is **not**
 followed by the thermostat's `0305` CFM (no consumer of 0608 exists in
 the image). The thermostat's cooling control surface is exactly §6.1–

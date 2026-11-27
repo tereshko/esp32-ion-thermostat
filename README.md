@@ -87,7 +87,9 @@ or AI — can go from zero to full context without asking anything:
 7. **[`docs/research/`](docs/research/)** — external sources: the
    SAM01-01XA ASCII spec analysis, infinitive register layouts, the
    gofinity boot-capture cross-check, Clarinox stack notes, sweeps,
-   and the open upstream thread (nebulous/infinitesp#61).
+   the open upstream thread (nebulous/infinitesp#61), and the
+   26-function thermostat-algorithms research phase 6 was built
+   from.
 8. **[`docs/firmware-history/`](docs/firmware-history/)** — the
    build-by-build write-ups of the node firmware (what each iteration
    changed and why), the mode-experiment plan and the bench-test
@@ -98,6 +100,10 @@ or AI — can go from zero to full context without asking anything:
 - **[`docs/STATUS-AND-PLAN.md`](docs/STATUS-AND-PLAN.md)** — where the
   project actually stands, the decision log, and the 10-step plan to
   replace the stock control.
+- **[`docs/BACKGROUND-HVAC.md`](docs/BACKGROUND-HVAC.md)** — why the
+  project exists: the dead W/W1 furnace input and the one-stage W2
+  fallback, why 24 V cooling is impossible, the stock control's dead
+  Wi-Fi, and the spare-control plan if it dies first.
 - **[`docs/HARDWARE-AND-POWER.md`](docs/HARDWARE-AND-POWER.md)** — the
   full parts inventory and the power-supply design space, including
   the isolation rule learned from the 2026-11-24 incident.

@@ -9,7 +9,8 @@ manuals — and then independently re-verified. Where something is still
 unknown, it is listed as unknown in §12.
 
 Reference installation: SYST0101CW wall control (firmware v4.79),
-Heil G80CTL1352422A two-stage gas furnace (107K BTU/h), Heil HVA960GKA
+Heil G80CTL1352422A two-stage gas furnace (107K BTU/h; the bus
+reports the model string as G80CTL1352422A2), Heil HVA960GKA
 variable-speed outdoor unit (60K, 5 ton), EN(A,D)4X61 evaporator coil,
 single zone.
 
@@ -35,11 +36,15 @@ is why any replacement needs a temperature sensor of its own.
 
 - Physical: RS-485, **38400 baud, 8N1**. Wall cable: DX+ green,
   DX− blue, C (common) white, D red (24 VAC).
-- A frame is a small header (destination, source, length, function)
-  plus payload, closed by a 16-bit CRC: nibble-wise reflected CRC
-  (polynomial A001, init 0), transmitted little-endian after a final
-  byte swap. The exact builder routine was recovered from the firmware
-  image and reproduces every captured frame.
+- A frame is a small header (destination, source, length, function,
+  table id) plus payload, closed by a 16-bit CRC: nibble-wise
+  reflected CRC (polynomial A001, init 0), transmitted little-endian
+  after a final byte swap. The exact builder routine was recovered
+  from the firmware image; it is proven on the wire by the
+  independent gofinity capture (1,532/1,532 frames) and
+  self-consistent on this installation's reconstructed frame bodies
+  — the local JSONL corpus stores no CRC bytes, so a wire-level
+  check against it is impossible in principle.
 - Function `0x0B` = read a table (the request), `0x06` = the read
   response, `0x0C` = write a table (full read-modify-write of the
   whole table image). This dialect has no write-acknowledgement
@@ -63,7 +68,7 @@ Every ≈10 s the thermostat emits the **command burst** — the frames
 that actually run the house:
 
 - `0305` — the demand frame (12 B): heat stage `[0]`, cool stage `[2]`,
-  blower CFM `[4..5]`, and a configuration byte `0x78` at `[11]` that is
+  blower CFM `[4..5]`, and a state byte `0x78` at `[11]` that is
   constant once the system is commissioned.
 - `0605` — compressor capacity command (7 B): a float on a **0–5
   scale** in `[0..3]`, a call-state byte at `[4]`, `[5]` always 0.
@@ -72,7 +77,8 @@ that actually run the house:
   coil parameter as a float (for the EN(A,D)4X61 coil, 1.69). It is
   built from the coil parameter stored at commissioning, not a
   universal constant.
-- `0602` — outdoor-unit housekeeping on the ~17 s tier.
+- `0602` — outdoor-unit housekeeping, a read poll on the ~17 s tier
+  (not a burst write).
 
 Timing facts that matter for anyone sharing the bus: the longest
 silence the thermostat ever leaves in steady state is **2.81 s**;
@@ -145,7 +151,8 @@ ICP personality. Consequences, all verified on the wire:
   replies** — any "mirror the SAM tables" design is dead on arrival.
 - SAM writes are accepted silently and ignored (no ACK, no error).
 - The thermostat itself initiates almost nothing toward the SAM
-  (six 0104 probes in the entire capture corpus).
+  (ten 0104 probes in the entire capture corpus: six from the 0x20
+  persona, four from the boot persona 0x1F).
 
 **400A control works anyway.** Registration is not required for the
 comfort table: a full-table write (`0x0C`) from `0x92` with the manual
@@ -167,8 +174,11 @@ cycle. The production rules the node firmware enforces:
 **A hard-won lesson.** The stock upstream climate component exposes
 six-plus live write paths into the dead SAM mirror, spawns entities the
 user never asked for, and its setters accept unauthenticated commands
-over a TCP console. In this installation that combination produced a
-furnace communication fault. The firmware in this repository therefore
+over a TCP console. In this installation a furnace communication
+fault followed a setpoint change through that component — strong
+circumstantial evidence, not proof (no capture exists for that
+minute; the console is exposure, not a suspect — PHASE5 §1.4 keeps
+the accounting). The firmware in this repository therefore
 has **no climate component at all** — only the guarded write-core
 above, driving plain number entities.
 
@@ -203,12 +213,16 @@ the demand pipeline reproduces the original arithmetic exactly.
   (Simplified form — the full floor, the gating byte and the
   per-mode clamps are EMULATOR-SPEC §5.6.)
   The per-ton family in firmware is {175…400}; observed on the wire:
-  {0, 378–384, 1166, 1232, 1368, 1617, 1660, 1710, 1750, 1760}.
+  {0, 378, 379, 382, 384, 1166, 1232, 1368, 1617, 1660, 1710, 1750,
+  1760}.
 - **Setpoint coordinates** convert through a size/temperature table
   pair with hard clamps; an oversize derate (≥61) forces demand to 0
   in both heating and cooling chains.
 - **Smart Recovery** is a fixed 90 minutes. The thermostat's clock,
-  once wrong, stays wrong — nothing on the bus corrects it.
+  once wrong, stays wrong — nothing in the observed system corrects
+  it (on this unit the measured offset is ≈13 h 19 min, the rate
+  correct; whether the node's own SYSTIME broadcast should
+  discipline it is an open question).
 
 ## 8. Protections live in the equipment, not the thermostat
 
@@ -342,7 +356,8 @@ history starts at `docs/firmware-history/PHASE1-2.md`.
 
 ---
 
-*Method note: the protocol facts come from ≈84 000 captured bus frames
+*Method note: the protocol facts come from 83,752 captured bus frames
+in the main corpus (101,352 counting the cold-start segments)
 and a second, independent 1 532-frame capture from a Bryant Evolution
 system (gofinity project), which the frame layer, boot sequence and
 commissioning behaviour match. The firmware facts come from the

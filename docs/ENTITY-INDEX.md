@@ -80,6 +80,12 @@ Entity ids the package expects on the node side (check at install):
   runtimes, ODU temperatures/pressures — and accessory-life sensors.
   The two ids the HA package depends on are listed in the CHECK note
   above; the full spawn set is the component's entity reference.
+  The package also hard-depends on three node **numbers** — verify
+  these ids after pairing, exactly like the CHECK pair:
+  `number.diy_thermostat_manual_heat_setpoint`,
+  `number.diy_thermostat_manual_cool_setpoint` (pinned by
+  `object_id:` in the firmware) and
+  `number.diy_thermostat_ha_heartbeat`.
 
 ## Home Assistant package — automation logic in one line each
 
@@ -121,8 +127,9 @@ Entity ids the package expects on the node side (check at install):
 - After the ±6 °F steering step, the desired pair is clamped into
   the corridors heat 60–80 / cool 68–86 before the write-core sees
   it. The ten profile numbers' boot placeholders: Home 68/76,
-  Away 60/80, Sleep 68/76, Wake 68/76, Manual — the wall's stored
-  pair once read.
+  Away 60/80, Sleep 68/76, Wake 68/76, Manual 68/76 — all five are
+  code `initial_value` placeholders; the wall's stored rows replace
+  them on the first 400A read.
 
 ## The HA package's own entities
 
@@ -187,9 +194,38 @@ The hub answers reads at 0x92 from its seeded register image
 ## Room-sensor flashing (owner-performed)
 
 The LYWSD03MMC units are flashed with ATC firmware via the Telink
-web flasher. Load-bearing details: advertising must be **ATC1441**
-(the `atc_mithermometer` platform parses only that format; PVVX is
-ignored), values in °C, and the advertising interval is set in the
-flasher (Room 2 = 5000 ms). MAC addresses and flasher settings live
-only in the owner's `secrets.yaml` / flasher session — the repo
-carries placeholders by design.
+web flasher. The reproducible path (learned on sensor 1, stock
+firmware 2.1.1_0159 / HW B1.6): the flasher's **"Do Activation"
+does not work** on this stock version — the sensor must first be
+registered in **Mi Home**, its DID / token / bindkey extracted
+with the Xiaomi-cloud-tokens-extractor, and the flasher's
+**Login** button used with those credentials (per pvvx issue
+#602); only then does the ATC flash (v5.9 on sensor 1) go through.
+Load-bearing details: advertising must be **ATC1441** (the
+`atc_mithermometer` platform parses only that format; the 15-byte
+PVVX frame variant is silently ignored), values in °C, and the
+advertising interval is set in the flasher (Room 2 = 5000 ms).
+MAC addresses and flasher settings live only in the owner's
+`secrets.yaml` / flasher session — the repo carries placeholders
+by design.
+
+## Behavioural details a rebuilder would otherwise miss
+
+- **Bus-online timeout:** the hub considers the bus offline after
+  30 s without a thermostat frame (`bus_online`); the write-core's
+  60 s bus-health guard is the stricter of the two.
+- **Anticipation episodes:** an episode closes when the room sensor
+  is within ±0.7 °F of its target with desired == stored; an episode
+  whose total span is under 0.3 °F is voided as settled noise.
+- **Fan circulation accounting** runs on UTC hour boundaries, not
+  local time — near a DST change the "hour" can be 59/61 minutes of
+  wall-clock time.
+- **Temporary Hold expiry** applies the current period twice (once
+  via the hold-mode change cascade, once directly) — idempotent,
+  but visible in the log.
+- **Filter clock initial value:** `hvac_filter_changed_at` ships
+  with initial 2026-01-01; set it to the real last-change date at
+  install or the first reminder comes early.
+- **Sensor names** can be renamed freely in the HA UI (no
+  reflash); the panel's on-screen room labels are compiled into the
+  panel firmware and change only by reflashing it.

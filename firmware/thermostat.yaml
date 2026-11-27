@@ -176,7 +176,8 @@ uart_tcp_server:
     max_clients: 4
     client_mode: fanout
     idle_timeout: 300s
-  # Bus capture stream (scrubbed: no credentials/serials), port 2373.
+  # Bus capture stream (scrubbed: credential frames 4608-460C dropped,
+  # equipment serials masked to their WWYY date prefixes), port 2373.
   - id: jsonl_uart
     port: 2373
     max_clients: 4
@@ -701,7 +702,9 @@ interval:
 # the active direction by clamp(err, -6..+6) relative to the
 # STORED byte: desired = stored + clamp(round(err)). As the room
 # converges, err -> 0 and desired -> stored, so steering settles
-# by construction (plus the +-0.7 F settled deadband below).
+# by construction. Moves are round(err) whole degrees (the wall pair
+# settles within +-0.5 F of desired); the anticipation episode below
+# closes when the sensor is within +-0.7 F of its target.
 # Direction: a running compressor means a cool call -> steer the
 # cool byte. Otherwise a room below target - 0.3 steers heat; a
 # room above target + 1.5 steers cool (large overshoot only —

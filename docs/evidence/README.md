@@ -27,3 +27,12 @@ counts below are reproducible from the same files.
   physically off the wall: who kept talking, and the equipment's
   complete non-reaction. The measured lower bound of the failover
   window.
+
+## Capture methodology
+
+Scenarios were captured in a fixed priority order — cold boot first
+(the most valuable), then idle, heat staging, fan-only, the cooling
+ramp, and mode/setpoint changes. **Faults were never induced on
+purpose**; when a real fault occurred, the log was kept and marked.
+Operator actions and times belong in each session's annotations —
+in this corpus the session index above carries them.

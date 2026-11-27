@@ -109,3 +109,8 @@ this build.
 it at the wall. The bench build changed nothing on the wall;
 while the ESP is on the bench the Ion heats from the wall
 alone, HA control paused.
+
+> **Warning:** the generated bench illustration circulated with
+> this kit is a visual mockup only — its wiring and labels are
+> approximate. Wire strictly by the text pin list above, never by
+> the picture.

@@ -8,9 +8,10 @@ below. This note is the missing first link of the delta chain.
 
 ## Phase 1 — passive mirror (closed 2026-10-29)
 
-- The node joined the bus as a SAM at `0x92` with the stock build:
-  telemetry entities spawned by the stock component, bus capture over
-  TCP 2373, ASCII console on TCP 23.
+- The node joined the bus with the stock build in **passive mode**
+  (`sam_address: 0` — it transmitted nothing; the `0x92` SAM persona
+  arrived with phase 2): telemetry entities spawned by the stock
+  component, bus capture over TCP 2373, ASCII console on TCP 23.
 - Result: the bus is fully readable from the SAM slot. The session
   captures founded the corpus (`../evidence/corpus.md`) and the
   protocol map (`../THERMOSTAT-PROTOCOL-MAP.md`): poll tiers, the
@@ -35,3 +36,29 @@ below. This note is the missing first link of the delta chain.
   the 400A comfort table honours writes from the SAM slot without it
   (`../evidence/400a-write-test.md`). Phase 3 built production
   control on exactly that.
+
+## Prequel — the first live tap (2026-10-28) failed, and why
+
+The day before phase 1 closed, the node's first connection to the
+bus took the system down: the thermostat reported the indoor unit
+lost, and the node received only **a 1,252-byte junk burst
+(crc_ok ≈ 5%) and then silence**. Removing the tap restored the
+system instantly. (The D/red wire was never connected in that
+attempt.)
+
+Post-mortem, in order: the module landing was verified from photos
+(GND = white, B = blue, A = green, screws tight, no stray strands);
+a multimeter found **no shorts anywhere**; shorts inside the
+permanent WAGO splices were excluded by the instant recovery on
+disconnect; an early clue — "3 lit LEDs" — was **retracted** (TX/RX
+LEDs lit on an idle-high line are normal). The surviving suspect
+was the module's live electrical behaviour, invisible to a meter:
+the MAX13487E's auto-direction driver keys on a **LOW at TXD** —
+with the ESP-side wires landed in the carrier board's **ground
+row** instead of the signal row, TXD sat low and the module
+transmitted continuously, holding the bus down. The same failure
+is described in the InfinitESP wiki (#39) and the Infinitude wiki.
+The decisive bench test: DC across A–B at rest (≈1.5–3 V means the
+module is keying the bus), then remove the module's RXD (yellow)
+wire. The retry rules and the A–B ≈ 0 V pre-flight in
+`../../HARDWARE-AND-POWER.md` §2.5 come from this incident.

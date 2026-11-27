@@ -29,15 +29,15 @@ Status dates are as of 2026-11-26.
 
 | Item | Key specs | Price | Purpose | Status |
 |---|---|---|---|---|
-| Display 3.5″ IPS Touch | ST7796U controller + FT6336U capacitive touch, 480×320, module 98×56 mm | $9.29 ($18.91 with delivery) | The panel screen | Ordered; bench assembly started |
+| Display 3.5″ IPS Touch | ST7796U controller + FT6336U capacitive touch, 480×320, module 98×56 mm | $9.29 ($18.91 with delivery) | The panel screen | Ordered 2026-11-12 |
 | Light sensor TSL2591, Qwiic | I2C 0x29; chosen over BH1750 for auto-brightness (wider range, no saturation in bright light, sensitive in the dark) | $3.70 | Auto-brightness via a window in the panel face | Ordered; sensors partially arrived by 2026-11-22 |
 | Temp/humidity sensor SHT40, Qwiic | I2C 0x44 | $2.40 | The panel's own room temperature — the future emulator's temperature input if the Ion dies; lives in an isolated vented chamber in the enclosure's lower-right corner so self-heating does not bias it | Ordered |
 | Spare Qwiic cable (single head) | JST SH 1.0 mm | $1.10 | Spare sensor interconnect | Ordered |
 | QT → Dupont female cables 200 mm ×3 | Qwiic (JST SH) to Dupont | $3.89 | Solderless sensor wiring | Ordered |
 | Presence radar LD2410C | 24 GHz mmWave; sits behind plain plastic in the enclosure's upper-right zone, clear of the display board and metal | $3.38 | Wakes the panel screen on presence | Ordered |
-| Microphone SPH0645 | I2S MEMS (WCMCU board) | $3.86 | Voice input for the panel | Ordered |
-| Amplifier MAX98357A | I2S, mono | $2.36 | Speaker output (media player / doorbell chime in HA) | Ordered |
-| Speakers 40 mm, 4 Ω, 3 W ×2 | With PH2.0 leads. On the mono amplifier the pair is wired **in series only (8 Ω total)** | $4.71 | Panel audio out | Ordered |
+| Microphone SPH0645 | I2S MEMS (WCMCU board) | $3.47 | Voice input for the panel | Ordered |
+| Amplifier MAX98357A | I2S, mono | $1.98 | Speaker output (media player / doorbell chime in HA) | Ordered |
+| Speakers 40 mm, 4 Ω, 3 W ×2 | With PH2.0 leads. On the mono amplifier the pair is wired **in series only (8 Ω total)** | $4.13 | Panel audio out | Ordered |
 | Collet (turned-pin) sockets 1×40, PH3mm, Gold | Low-profile (~3 mm) | — | The ESP sits removable on the panel carrier — no desoldering | Ordered (confirmed 2026-11-17) |
 | JST SH sockets, horizontal (side-entry), 4-pin | Side entry keeps the stack thin: cable leaves parallel to the carrier (~3 mm instead of +8–10 mm vertical) | — | Qwiic sensor sockets soldered onto the carrier | Ordered (confirmed 2026-11-17) |
 | Screw terminals KF301-2P | ~9–10 mm tall — the tallest part on the carrier | — | Bus/power connections on the carrier | Ordered (confirmed 2026-11-17) |
@@ -53,15 +53,21 @@ evaluated and **rejected** — the S3 stays.
 | Item | Key specs | Purpose | Status |
 |---|---|---|---|
 | LYWSD03MMC №1 | ATC firmware v5.9, ATC1441 advertising, values in °C, ESPHome platform `atc_mithermometer`, bound by MAC | Room temperature input for sensor steering; physically in the children's room ("Room 1" in the firmware) | Installed and live since phase 4; advertising interval is the factory 2500 ms |
-| LYWSD03MMC №2 | ATC firmware, ATC1441, °C, advertising interval set to **5000 ms** | Second room sensor ("Room 2") | Ordered with the 2026-11-17 batch; configured 2026-11-24; telemetry only — not a steering input |
+| LYWSD03MMC №2 | ATC firmware, ATC1441, °C, advertising interval set to **5000 ms** | Second room sensor ("Room 2") | Ordered with the 2026-11-12 panel batch; configured 2026-11-24; telemetry only — not a steering input |
 | CR2032 cells | Sensors often ship without batteries | Power for the BLE sensors | Purchase not confirmed in the project records |
+
+Why BLE: it is already in the ESP32 — no hub or coordinator needed
+(a Zigbee coordinator would add ~$30 and a Home Assistant binding;
+Wi-Fi sensors drain batteries). Each unit runs about a year on its
+CR2032; the battery level is advertised and the panel design shows
+a low-battery warning.
 
 ### 1.5 Bench and consumables already on hand
 
 | Item | Notes | Status |
 |---|---|---|
 | Phenolic prototyping boards 5×7 cm ×10 | 1.2 mm, single-sided; two butted (100×70) suffice for a prototype carrier | On hand |
-| Breadboard MB-102 (830 points) | Panel bench-test layout and firmware (`panel-bench-test`) are written for it; the classic ESP32 from the wall node serves as the bench MCU while the S3 boards were in transit | Bench assembly started 2026-11-22 |
+| Breadboard MB-102 (830 points) | Panel bench-test layout and firmware (`panel-bench-test`) are written for it; the classic ESP32 from the wall node serves as the bench MCU while the S3 boards were in transit | Bench assembly not confirmed in the project records |
 | AHT10 sensor | I2C 0x38, with header | Bench/spare only — the panel gets the SHT40 |
 | Heat-set brass inserts M2 + screws, 500 pcs | Enclosure fasteners for the 3D-printed case | On hand — enclosure fastening closed |
 | USB power bank / any 5 V USB charger | Interim node power, independent of the furnace breaker (actually ideal for cold-start captures) | In use as the interim supply |
@@ -71,7 +77,7 @@ evaluated and **rejected** — the S3 stays.
 
 | Item | Verdict |
 |---|---|
-| **XWST sealed AC 24 V → DC 5 V converter, 3 A variant** (ordered 2026-11-12, $7.68, "3A With DC Output") | **Never connect to the bus, in any wiring variant.** Non-isolated — see the incident in Part 2. |
+| **XWST sealed AC 24 V → DC 5 V converter, 3 A variant** (ordered 2026-11-12, $7.10, "3A With DC Output") | **Never connect to the bus, in any wiring variant.** Non-isolated — see the incident in Part 2. |
 | Earlier "waohei" sealed converter found 2026-10-24 | DC-input only, does not run from furnace 24 VAC at all — rejected before purchase |
 | ESP32-P4 / Waveshare all-in-one panel boards | Evaluated 2026-11-17, rejected by decision — panel stays on ESP32-S3 |
 
@@ -117,7 +123,11 @@ non-isolated converter, any such tee shorts C↔D just the same.
 
 > **Bus power comes only through a converter with galvanic isolation
 > stated in its datasheet.** "AC input" on a marketplace listing is
-> not evidence of isolation — the XWST listing never claimed it, and
+> not evidence of isolation — the XWST listing never claimed it.
+> (Provenance, kept deliberately: the XWST had been recommended on
+> the strength of its product listing alone, without a datasheet
+> check. The project's standing rule since: establish the failure
+> mechanism from primary sources before recommending hardware.)
 > the manufacturer's specification says the line is non-isolated.
 > Before any converter is connected to the bus, ring out input ↔
 > output with a meter: it must be open circuit. A non-isolated
@@ -160,7 +170,10 @@ C/D 24 VAC → 1 A slow-blow fuse → bridge rectifier (KBP210 class)
    measure the RS-485 module's A–B: ≈0 V at rest. A module holding
    the line (wrong pin row on the carrier — signal wires belong in
    the blue S row only) keys the bus and makes the thermostat lose
-   the furnace.
+   the furnace. Landing rules from the same incident: tap the bus
+   with **WAGO tees only** (never wires under the thermostat's own
+   screws), land **A/B only first** — no C/GND — and have a photo
+   of the assembled node checked **before** power is applied.
 1. **Bench first.** Power the assembled chain from a bench DC source
    swept over the rectified range (≈19–48 V): the output must be a
    clean 5.0 V, and input ↔ output must ring out as an open circuit.
@@ -176,7 +189,11 @@ C/D 24 VAC → 1 A slow-blow fuse → bridge rectifier (KBP210 class)
 
 - **Decision not taken.** The owner is still choosing between the
   Mornsun chain (Option A) and the PowerStream unit (Option B);
-  neither is ordered.
+  neither is ordered. The owner's stated preference leans to a
+  single finished device with no assembly ("one device, no
+  soldering") — which favours Option B's form factor but not its
+  size; Option A is the datasheet-verified electrical choice and
+  assembles entirely on connectors.
 - The node remains **fully disconnected from the furnace and powered
   over USB**. The furnace runs autonomously from the Ion wall
   control; Home Assistant control is paused.

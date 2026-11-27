@@ -9,6 +9,9 @@ Usage:
     python capture.py coldstart
     -> saves coldstart-2026-10-28-143000.jsonl next to this script
 Stop with Ctrl+C; the .jsonl file is the capture.
+
+Note: the client flushes per chunk — a 0 KB capture file means the
+stream never started in that run, not that buffered data was lost.
 """
 
 import socket
