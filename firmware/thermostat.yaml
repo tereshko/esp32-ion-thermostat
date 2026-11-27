@@ -1,0 +1,1068 @@
+# ============================================================
+# DIY Thermostat - the unified node firmware.
+# ESPHome node on the Carrier/ICP Ion bus: SAM (0x92) telemetry
+# and setpoint control via the 400A comfort table, hardened
+# write-core, sensor steering, HA profiles/holds, dead-man
+# return. Works with NO room sensors (bare ESP + RS-485 board);
+# sensor steering stays inert while the BLE sensor is absent
+# or stale. Read docs/HOW-IT-WORKS.md for the full picture and
+# firmware/README.md for build/flash instructions.
+# =============================================================
+#   1. SNTP clock (id: sntp_time) next to the HA clock. The
+#      dead-man return below must be able to judge time when
+#      Home Assistant - the source of ha_time - is the thing
+#      that died.
+#   2. "HA Heartbeat" number: HA writes the current epoch into
+#      it every 5 min (home-assistant.yaml). Local-only - the
+#      set_action stores the value in a global, never the bus.
+#   3. "Dead-man Return" switch + "Dead-man Hours" setting:
+#      if the heartbeat is older than the limit AND the stored
+#      manual pair sits outside the safe band (heat 60-72,
+#      cool 74-85), the node writes the baseline pair 68/78
+#      through the same guarded write-core - once per outage.
+#      Protects against a setpoint stranded by a dead HA /
+#      crashed automation. Default OFF, like every control
+#      switch in this build.
+#   4. Fan circulation accounting: minutes the blower already
+#      ran on real calls this hour now COUNT toward the
+#      "Fan Minutes Per Hour" target; circulation tops up only
+#      the missing minutes instead of always running the
+#      first N minutes of the hour. Ownership rules unchanged.
+# NOT in this build (need room sensors - later): adaptive
+# recovery / optimum start, occupancy setback from room
+# sensors, multi-sensor averaging, humidity overcool,
+# freeze monitoring. Setpoint separation stays cool >=
+# heat + 3 (the Honeywell default; +5 would forbid the
+# proven 70/73 manual pair).
+#
+# WALL CONTRACT: the Ion must run
+# its Touch-N-Go MANUAL entry for the manual-row values to
+# govern. This build never writes anything but the 400A
+# comfort row.
+#
+# Rollback: reflash the previous revision of this file.
+# ============================================================
+
+substitutions:
+  name: diy-thermostat
+  friendly_name: DIY Thermostat
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    version: recommended
+
+# Logging over USB — useful during bring-up.
+logger:
+  baud_rate: 115200
+
+api:
+  reboot_timeout: 0s  # never reboot just because Home Assistant is away (long bus captures)
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "DIY-Thermostat-Fallback"
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+  # An HA-independent clock (WiFi SNTP). The dead-man
+  # return judges heartbeat age on THIS clock: ha_time dies
+  # together with the Home Assistant it watches.
+  - platform: sntp
+    id: sntp_time
+
+# --- Runtime state (RAM only; nothing here survives a reboot) ---
+globals:
+  - id: ble_last_seen_epoch
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: fan_we_set_it
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: steer_episode_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: steer_episode_start_f
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: steer_episode_dir
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: steer_episode_standing_byte
+    type: int
+    restore_value: false
+    initial_value: '-1'
+  - id: steer_coast
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: steer_coast_until_epoch
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: steer_restore_done
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+  # --- Dead-man state (RAM only) ---
+  - id: ha_heartbeat_epoch
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: deadman_fired
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: circ_credit_min
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: circ_ran_min
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: circ_last_hour
+    type: int
+    restore_value: false
+    initial_value: '-1'
+
+# InfinitESP components: uart-link from git (TCP servers), the
+# rest local from the components/ folder (hardened copy).
+external_components:
+  - source:
+      type: git
+      url: https://github.com/nebulous/esphome-uart-link
+  - source:
+      type: local
+      path: components
+
+# --- RS-485 bus: hardware UART2, 38400 8N1 ---
+# Auto-direction module — no DE/RE pins.
+# Wiring: module VCC->3V3, GND->GND, TXD->GPIO16(RX), RXD->GPIO17(TX)
+#         D+ (A) -> DX+, D- (B) -> DX- at the furnace
+uart:
+  id: bus_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 38400
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 4096
+
+# --- TCP servers for the SAM ASCII console and the capture stream ---
+# Port 23 console is READ-ONLY in this build (write verbs NAK).
+uart_tcp_server:
+  - id: ascii_uart
+    port: 23
+    max_clients: 4
+    client_mode: fanout
+    idle_timeout: 300s
+  # Bus capture stream (scrubbed: no credentials/serials), port 2373.
+  - id: jsonl_uart
+    port: 2373
+    max_clients: 4
+    client_mode: fanout
+    idle_timeout: 300s
+    rx_buffer_size: 1024
+    tx_buffer_size: 2048
+
+sam_ascii:
+  id: sam_ascii_server
+  infinitesp_id: infinitesp_hub
+  uart_id: ascii_uart
+
+bus_jsonl:
+  infinitesp_id: infinitesp_hub
+  uart_id: jsonl_uart
+
+# --- InfinitESP hub: SAM emulation at 0x92 ---
+# On this ICP Ion the SAM never registers (SAM-REGISTRATION-
+# RESEARCH.md) — irrelevant here: the 400A control path does not
+# need registration, proven 2026-10-30. Ion stays master of the
+# equipment; this node only steers comfort-row bytes through the
+# guarded write-core.
+infinitesp:
+  id: infinitesp_hub
+  uart_id: bus_uart
+  sam_address: 0x92
+
+# NO climate: block in this build — see the header. The HA mirror
+# is the profile numbers + fan sensors + bus health + the stock
+# telemetry entities (furnace/ODU registers are real, passively
+# snooped). There is intentionally no entity that shows a "wall
+# current temperature": this Ion does not serve one to a SAM
+# (docs/HOW-IT-WORKS.md §6).
+
+# --- BLE: Xiaomi LYWSD03MMC with ATC firmware ---
+esp32_ble_tracker:
+
+sensor:
+  - platform: atc_mithermometer
+    mac_address: "AA:BB:CC:00:00:01"  # Room 1 sensor (LYWSD03MMC, ATC v5.9, advertising type must be ATC1441 — ESPHome cannot parse PVVX Custom)
+    temperature:
+      name: "Room 1 Temperature"
+      id: room1_temp
+      on_value:
+        then:
+          - lambda: |-
+              auto now = id(ha_time).now();
+              if (now.is_valid()) id(ble_last_seen_epoch) = (int) now.timestamp;
+    humidity:
+      name: "Room 1 Humidity"
+    battery_level:
+      name: "Room 1 Battery"
+
+  - platform: atc_mithermometer
+    mac_address: "AA:BB:CC:00:00:02"  # Room 2 sensor (LYWSD03MMC, ATC, advertising ATC1441, interval 5000 ms; configured 2026-11-24)
+    temperature:
+      name: "Room 2 Temperature"
+      id: room2_temp
+      # Deliberately NO on_value stamp here: ble_last_seen_epoch is
+      # Room 1's silence guard for sensor steering. Room 2 packets
+      # must not refresh it.
+    humidity:
+      name: "Room 2 Humidity"
+    battery_level:
+      name: "Room 2 Battery"
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  # --- Mirror: per-activity fan bytes (read-only) ---
+  # 0 = Auto, 1 = Low, 2 = Med, 3 = High; -1 = row not cached yet.
+  - platform: template
+    name: "Home Fan Mode"
+    update_interval: 60s
+    lambda: |-
+      return (float) id(infinitesp_hub).get_activity_fan(0);
+  - platform: template
+    name: "Away Fan Mode"
+    update_interval: 60s
+    lambda: |-
+      return (float) id(infinitesp_hub).get_activity_fan(1);
+  - platform: template
+    name: "Sleep Fan Mode"
+    update_interval: 60s
+    lambda: |-
+      return (float) id(infinitesp_hub).get_activity_fan(2);
+  - platform: template
+    name: "Wake Fan Mode"
+    update_interval: 60s
+    lambda: |-
+      return (float) id(infinitesp_hub).get_activity_fan(3);
+  - platform: template
+    name: "Manual Fan Mode"
+    update_interval: 60s
+    lambda: |-
+      return (float) id(infinitesp_hub).get_activity_fan(4);
+
+  # --- Mirror: bus health (the write-core's gate input) ---
+  - platform: template
+    name: "Bus Reply Age"
+    unit_of_measurement: "s"
+    update_interval: 30s
+    entity_category: diagnostic
+    lambda: |-
+      uint32_t age = id(infinitesp_hub).get_tstat_reply_age_ms();
+      return age == 4294967295UL ? -1.0f : (float) age / 1000.0f;
+
+binary_sensor:
+  - platform: status
+    name: "Device Status"
+
+  # Driven by publish_state from the 30 s interval at the bottom
+  # (no lambda here on purpose — the manual template pattern).
+  - platform: template
+    name: "Bus Healthy"
+    id: bus_healthy_bs
+
+# ============================================================
+# CONTROL SURFACE — profile setpoint numbers.
+# Ten template numbers: heat/cool for each 400A activity
+# (home 0 / away 1 / sleep 2 / wake 3 / manual 4). Setting one in
+# HA runs its set_action ONCE: a guarded write through the hub
+# write-core (write_activity_heat/cool — guards: SAM on, range,
+# fresh cache <= 10 min, deadband on the resulting pair, equality
+# no-op, bus-health gate, global 10 s rate limit). After the
+# attempt the number re-publishes the STORED byte, so a refused
+# write visibly snaps back to the truth instead of showing a
+# phantom value. The manual pair keeps its established names/ids (HA continuity).
+# ============================================================
+number:
+  - platform: template
+    name: "Home Heat Setpoint °F"
+    id: home_heat_setpoint
+    min_value: 50
+    max_value: 85
+    step: 1
+    initial_value: 68
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_heat(0, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_heat_f(0);
+          if (stored >= 0) id(home_heat_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Home Cool Setpoint °F"
+    id: home_cool_setpoint
+    min_value: 60
+    max_value: 99
+    step: 1
+    initial_value: 76
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_cool(0, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_cool_f(0);
+          if (stored >= 0) id(home_cool_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Away Heat Setpoint °F"
+    id: away_heat_setpoint
+    min_value: 50
+    max_value: 85
+    step: 1
+    initial_value: 60
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_heat(1, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_heat_f(1);
+          if (stored >= 0) id(away_heat_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Away Cool Setpoint °F"
+    id: away_cool_setpoint
+    min_value: 60
+    max_value: 99
+    step: 1
+    initial_value: 80
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_cool(1, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_cool_f(1);
+          if (stored >= 0) id(away_cool_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Sleep Heat Setpoint °F"
+    id: sleep_heat_setpoint
+    min_value: 50
+    max_value: 85
+    step: 1
+    initial_value: 68
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_heat(2, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_heat_f(2);
+          if (stored >= 0) id(sleep_heat_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Sleep Cool Setpoint °F"
+    id: sleep_cool_setpoint
+    min_value: 60
+    max_value: 99
+    step: 1
+    initial_value: 76
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_cool(2, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_cool_f(2);
+          if (stored >= 0) id(sleep_cool_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Wake Heat Setpoint °F"
+    id: wake_heat_setpoint
+    min_value: 50
+    max_value: 85
+    step: 1
+    initial_value: 68
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_heat(3, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_heat_f(3);
+          if (stored >= 0) id(wake_heat_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Wake Cool Setpoint °F"
+    id: wake_cool_setpoint
+    min_value: 60
+    max_value: 99
+    step: 1
+    initial_value: 76
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_cool(3, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_cool_f(3);
+          if (stored >= 0) id(wake_cool_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Manual Heat Setpoint °F"
+    id: manual_heat_setpoint
+    min_value: 50
+    max_value: 85
+    step: 1
+    initial_value: 68
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_heat(4, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_heat_f(4);
+          if (stored >= 0) id(manual_heat_setpoint).publish_state((float) stored);
+
+  - platform: template
+    name: "Manual Cool Setpoint °F"
+    id: manual_cool_setpoint
+    min_value: 60
+    max_value: 99
+    step: 1
+    initial_value: 76
+    optimistic: false
+    restore_value: false
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: |-
+          id(infinitesp_hub).write_activity_cool(4, (uint8_t) x);
+          int stored = id(infinitesp_hub).get_activity_cool_f(4);
+          if (stored >= 0) id(manual_cool_setpoint).publish_state((float) stored);
+
+# ============================================================
+# STEERING / CIRCULATION SETTINGS. These numbers
+# only REMEMBER values (set_action publishes the set value;
+# restore_value keeps it across reboots). They never touch the
+# bus themselves — the interval lambdas below read them.
+# ============================================================
+  - platform: template
+    name: "Room Target °F"
+    id: room_target
+    min_value: 60
+    max_value: 80
+    step: 1
+    initial_value: 72
+    optimistic: true
+    restore_value: true
+    mode: box
+    unit_of_measurement: "°F"
+    set_action:
+      - lambda: id(room_target).publish_state(x);
+
+  - platform: template
+    name: "Anticipation %"
+    id: anticipation_pct
+    min_value: 50
+    max_value: 95
+    step: 5
+    initial_value: 80
+    optimistic: true
+    restore_value: true
+    mode: box
+    unit_of_measurement: "%"
+    set_action:
+      - lambda: id(anticipation_pct).publish_state(x);
+
+  - platform: template
+    name: "Fan Minutes Per Hour"
+    id: fan_minutes
+    min_value: 5
+    max_value: 60
+    step: 5
+    initial_value: 15
+    optimistic: true
+    restore_value: true
+    mode: box
+    set_action:
+      - lambda: id(fan_minutes).publish_state(x);
+
+# ============================================================
+# DEAD-MAN SETTINGS. Same local-only pattern as
+# the steering settings above: these numbers only REMEMBER
+# values, they never touch the bus.
+# "HA Heartbeat": Home Assistant writes the current epoch
+# seconds into it every 5 min (home-assistant.yaml). The set_action
+# stores the value into a global - that is the ONLY thing it
+# does. restore_value is FALSE on purpose: after a reboot the
+# heartbeat reads 0 ("never received") until HA writes again,
+# so the dead-man can never arm on a remembered value.
+# Precision note: the value travels as a float; at ~1.79e9 the
+# float32 spacing is 128 s, so the stored epoch can be off by
+# up to ~64 s. The dead-man limit is in hours - irrelevant.
+# ============================================================
+  - platform: template
+    name: "HA Heartbeat"
+    id: ha_heartbeat
+    min_value: 0
+    max_value: 2000000000
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: false
+    mode: box
+    set_action:
+      - lambda: |-
+          id(ha_heartbeat_epoch) = (int) x;
+          id(ha_heartbeat).publish_state(x);
+
+  - platform: template
+    name: "Dead-man Hours"
+    id: deadman_hours
+    min_value: 1
+    max_value: 24
+    step: 1
+    initial_value: 6
+    optimistic: true
+    restore_value: true
+    mode: box
+    unit_of_measurement: "h"
+    set_action:
+      - lambda: id(deadman_hours).publish_state(x);
+
+# ============================================================
+# FEATURE SWITCHES — optimistic template switches. Flipping one
+# only changes local state that the interval lambdas below read;
+# the switches themselves never touch the bus. All are
+# RESTORE_DEFAULT_OFF: after any reboot every feature stays off
+# until the author turns it on.
+# "Fan Control Enable" is the first-test gate for the
+# 400A fan byte (byte 30 has never been write-tested live):
+# fan circulation can write ONLY while this switch AND the
+# "Fan Circulation" switch are both on.
+# ============================================================
+switch:
+  - platform: template
+    name: "Sensor Steering"
+    id: steering_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: id(steering_switch).publish_state(true);
+    turn_off_action:
+      - lambda: id(steering_switch).publish_state(false);
+
+  - platform: template
+    name: "Fan Circulation"
+    id: fan_circ_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: id(fan_circ_switch).publish_state(true);
+    turn_off_action:
+      - lambda: id(fan_circ_switch).publish_state(false);
+
+  - platform: template
+    name: "Fan Control Enable"
+    id: fan_enable_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: id(fan_enable_switch).publish_state(true);
+    turn_off_action:
+      - lambda: id(fan_enable_switch).publish_state(false);
+
+  # Arms the dead-man return (see the interval at the
+  # end of this file). RESTORE_DEFAULT_OFF like every control
+  # switch in this build: after a reboot the protection is off
+  # until the author turns it on.
+  - platform: template
+    name: "Dead-man Return"
+    id: deadman_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: id(deadman_switch).publish_state(true);
+    turn_off_action:
+      - lambda: id(deadman_switch).publish_state(false);
+
+# ============================================================
+# READ-BACK SYNC — publishes the STORED 400A bytes (from the
+# node's poll cache) into the ten number states. This is the
+# only autonomous publisher of these entities and it CANNOT
+# write to the bus: publish_state() updates local state only;
+# a bus write exists solely behind set_action above, which
+# ESPHome invokes only for an external set call. Belt and
+# braces: even a value that somehow re-entered the write path
+# would equal the stored byte and no-op in the hub (guard 5).
+# Consequence: after the wall re-seeds an entry or a profile is
+# edited at the wall, these entities converge to the wall's
+# values within one poll cycle + one sync tick — correct.
+# ============================================================
+interval:
+  - interval: 45s
+    then:
+      - lambda: |-
+          for (int a = 0; a < 5; a++) {
+            int h = id(infinitesp_hub).get_activity_heat_f(a);
+            int c = id(infinitesp_hub).get_activity_cool_f(a);
+            if (h < 0 || c < 0) continue;
+            switch (a) {
+              case 0:
+                if ((int) id(home_heat_setpoint).state != h) id(home_heat_setpoint).publish_state((float) h);
+                if ((int) id(home_cool_setpoint).state != c) id(home_cool_setpoint).publish_state((float) c);
+                break;
+              case 1:
+                if ((int) id(away_heat_setpoint).state != h) id(away_heat_setpoint).publish_state((float) h);
+                if ((int) id(away_cool_setpoint).state != c) id(away_cool_setpoint).publish_state((float) c);
+                break;
+              case 2:
+                if ((int) id(sleep_heat_setpoint).state != h) id(sleep_heat_setpoint).publish_state((float) h);
+                if ((int) id(sleep_cool_setpoint).state != c) id(sleep_cool_setpoint).publish_state((float) c);
+                break;
+              case 3:
+                if ((int) id(wake_heat_setpoint).state != h) id(wake_heat_setpoint).publish_state((float) h);
+                if ((int) id(wake_cool_setpoint).state != c) id(wake_cool_setpoint).publish_state((float) c);
+                break;
+              case 4:
+                if ((int) id(manual_heat_setpoint).state != h) id(manual_heat_setpoint).publish_state((float) h);
+                if ((int) id(manual_cool_setpoint).state != c) id(manual_cool_setpoint).publish_state((float) c);
+                break;
+            }
+          }
+
+# ============================================================
+# SENSOR STEERING (30 s tick), feedback form.
+# An earlier design steered with desired = target + (wall temp -
+# room temp) and took direction, mode and action from the stock
+# climate entity. On THIS Ion all three are fossils (the
+# thermostat serves an unregistered SAM all-zero 3B02/3B03 and
+# never broadcasts them — docs/HOW-IT-WORKS.md §6): wall temp
+# froze at the 70 F seed, mode at OFF. Steering built on them
+# would read mode OFF and never steer at all. This build
+# therefore uses ONLY live inputs:
+#   - the Room 1 BLE sensor (real),
+#   - the stored manual-row bytes (real, polled 400A),
+#   - passive equipment state from the hub: compressor state
+#     (ODU 0604 actual RPM) and blower RPM (furnace 0306) — both
+#     snooped from the thermostat's own equipment polls.
+# FORMULA (feedback, no wall temp needed): every tick computes
+# err = Room Target - sensor temp and moves the manual byte for
+# the active direction by clamp(err, -6..+6) relative to the
+# STORED byte: desired = stored + clamp(round(err)). As the room
+# converges, err -> 0 and desired -> stored, so steering settles
+# by construction (plus the +-0.7 F settled deadband below).
+# Direction: a running compressor means a cool call -> steer the
+# cool byte. Otherwise a room below target - 0.3 steers heat; a
+# room above target + 1.5 steers cool (large overshoot only —
+# small overshoots in heat season are left to the wall). No
+# direction -> no writes. Steering NEVER changes the system
+# mode: if the wall is in Heat mode, a steered cool byte is
+# inert data in the row, and vice versa.
+# EPISODES / ANTICIPATION: the state machine —
+# progress is measured on the SENSOR temperature from episode
+# start to target; at "Anticipation %" the boost is cut. ONE
+# One constraint, forced by the missing wall temperature: a
+# cutoff byte guaranteed to end the wall's call (wall temp - 1)
+# cannot be computed here, so the cutoff UNDOES the episode's
+# boost (restores the byte that was stored when the episode
+# started). If that standing byte
+# was itself calling, the call continues at the standing rate —
+# the wall's own pre-existing behavior, not a state this build
+# created. Then 120 s hands-off (coast), one restore write to
+# the then-current feedback desired, and hands-off until the
+# room drifts 1 F past target the other way.
+# ALL WRITES go through write_activity_pair() — the final pair
+# is computed first (pair-unlock folded into the same frame:
+# cool >= heat + 3 enforced by construction, caps 88 / floor 50
+# by construction) and lands as ONE guarded frame, or none.
+# Stale or missing sensor (> 900 s) = no writes.
+# ============================================================
+  - interval: 30s
+    then:
+      - lambda: |-
+          const char *TAG = "steering";
+          int now_ts = (int) id(ha_time).now().timestamp;
+          // (1) Steering OFF — clear episode/coast state, stay silent.
+          if (!id(steering_switch).state) {
+            if (id(steer_episode_active) || id(steer_coast) || id(steer_episode_dir) != 0) {
+              id(steer_episode_active) = false;
+              id(steer_episode_dir) = 0;
+              id(steer_episode_standing_byte) = -1;
+              id(steer_coast) = false;
+              id(steer_coast_until_epoch) = 0;
+              id(steer_restore_done) = true;
+            }
+            return;
+          }
+          // (2) Sensor validity: NaN, unsynced clock, or a reading older
+          // than 900 s (the BLE freshness stamp is kept by on_value).
+          float t_s = id(room1_temp).state;
+          float t_s_f = t_s * 9.0f / 5.0f + 32.0f;  // sensor state is C; everything else here is F
+          int ble_age = now_ts - id(ble_last_seen_epoch);
+          if (isnan(t_s) || now_ts < 1700000000 || ble_age > 900) {
+            ESP_LOGW(TAG, "sensor invalid (state=%.2f C, ble age %d s, now %d) - no steering", t_s, ble_age, now_ts);
+            return;
+          }
+          float target = id(room_target).state;
+          int stored_heat = id(infinitesp_hub).get_activity_heat_f(4);
+          int stored_cool = id(infinitesp_hub).get_activity_cool_f(4);
+          if (stored_heat < 0 || stored_cool < 0) return;  // row not cached yet
+          // (3) Direction from live inputs only (see header).
+          int comp = id(infinitesp_hub).get_compressor_state();  // -1 unknown, 0 off, 1 running
+          int rpm = id(infinitesp_hub).get_blower_rpm();          // -1 unknown
+          int dir = 0;  // 1 = heat, 2 = cool
+          if (id(steer_coast) || id(steer_episode_active)) {
+            dir = id(steer_episode_dir);  // an episode/coast keeps its direction
+          } else if (comp == 1) {
+            dir = 2;
+          } else if (t_s_f < target - 0.3f) {
+            dir = 1;
+          } else if (t_s_f > target + 1.5f) {
+            dir = 2;
+          } else {
+            return;  // settled band / indeterminate — no writes
+          }
+          if (dir != 1 && dir != 2) return;
+          // (4) Feedback desired for the direction's byte.
+          int stored = (dir == 1) ? stored_heat : stored_cool;
+          int delta = (int) lroundf(target - t_s_f);
+          if (delta > 6) delta = 6;
+          if (delta < -6) delta = -6;
+          int desired = stored + delta;
+          if (dir == 1) {
+            if (desired < 60) desired = 60;
+            if (desired > 80) desired = 80;
+          } else {
+            if (desired < 68) desired = 68;
+            if (desired > 86) desired = 86;
+          }
+          // Pair builder: start from the stored pair, set the steered
+          // byte, then enforce cool >= heat + 3 by moving the OTHER
+          // byte (unlock caps: cool <= 88, heat >= 50).
+          auto build_pair = [&](int dbyte, int &out_h, int &out_c) {
+            out_h = stored_heat;
+            out_c = stored_cool;
+            if (dir == 1) out_h = dbyte; else out_c = dbyte;
+            if (out_c < out_h + 3) {
+              if (dir == 1) {
+                out_c = out_h + 3;
+                if (out_c > 88) { out_c = 88; out_h = 85; }
+              } else {
+                out_h = out_c - 3;
+                if (out_h < 50) { out_h = 50; out_c = 53; }
+              }
+            }
+          };
+          // (5) COAST — the anticipatory cutoff already fired for this
+          // episode; residual heat is carrying the room.
+          if (id(steer_coast)) {
+            int cdir = id(steer_episode_dir);
+            // Release: the room drifted 1 F past target the other way.
+            if ((cdir == 1 && t_s_f <= target - 1.0f) || (cdir == 2 && t_s_f >= target + 1.0f)) {
+              id(steer_coast) = false;
+              id(steer_episode_active) = false;
+              id(steer_episode_dir) = 0;
+              id(steer_episode_standing_byte) = -1;
+              id(steer_coast_until_epoch) = 0;
+              id(steer_restore_done) = true;
+              ESP_LOGI(TAG, "coast released (T_s=%.1f F, target=%.1f F) - normal steering resumes", t_s_f, target);
+              return;
+            }
+            // Inside the 120 s residual-heat window: hands fully off.
+            if (now_ts < id(steer_coast_until_epoch)) return;
+            // Window over: restore ONCE to the current feedback desired
+            // for the EPISODE's direction. Never starts an episode.
+            if (!id(steer_restore_done)) {
+              int sdir = dir;
+              dir = cdir;  // build_pair keys on dir
+              int rstored = (cdir == 1) ? stored_heat : stored_cool;
+              int rdelta = (int) lroundf(target - t_s_f);
+              if (rdelta > 6) rdelta = 6;
+              if (rdelta < -6) rdelta = -6;
+              int rdesired = rstored + rdelta;
+              if (cdir == 1) {
+                if (rdesired < 60) rdesired = 60;
+                if (rdesired > 80) rdesired = 80;
+              } else {
+                if (rdesired < 68) rdesired = 68;
+                if (rdesired > 86) rdesired = 86;
+              }
+              int ph, pc;
+              build_pair(rdesired, ph, pc);
+              dir = sdir;
+              if (ph != stored_heat || pc != stored_cool) {
+                if (id(infinitesp_hub).write_activity_pair(4, (uint8_t) ph, (uint8_t) pc)) {
+                  ESP_LOGI(TAG, "coast restore -> heat %d cool %d", ph, pc);
+                } else {
+                  ESP_LOGW(TAG, "coast restore refused by a hub guard - numbers stay as stored");
+                }
+              } else {
+                ESP_LOGI(TAG, "coast restore -> already stored, no write");
+              }
+              id(steer_restore_done) = true;
+            }
+            return;  // hands-off until the release condition fires
+          }
+          // (6) EPISODE START — this tick pushes in dir (desired beyond
+          // the stored byte in the pushing sense) or a call in dir is
+          // already running (heat call approximation: blower turning
+          // with the compressor off; cool call: compressor running).
+          bool pushing = (dir == 1) ? (desired > stored) : (desired < stored);
+          bool calling = (dir == 1) ? (rpm > 0 && comp == 0) : (comp == 1);
+          if (!id(steer_episode_active) && (pushing || calling)) {
+            id(steer_episode_active) = true;
+            id(steer_episode_start_f) = t_s_f;
+            id(steer_episode_dir) = dir;
+            id(steer_episode_standing_byte) = stored;
+            ESP_LOGI(TAG, "episode start: dir=%s T_s=%.1f F target=%.1f F desired=%d stored=%d standing=%d",
+                     dir == 1 ? "heat" : "cool", t_s_f, target, desired, stored, stored);
+          }
+          // (7) PROGRESS + ANTICIPATORY CUTOFF.
+          if (id(steer_episode_active)) {
+            if (id(steer_episode_dir) != dir) {
+              id(steer_episode_active) = false;
+              id(steer_episode_dir) = 0;
+              id(steer_episode_standing_byte) = -1;
+              ESP_LOGI(TAG, "episode dropped: direction changed");
+            } else {
+              float start = id(steer_episode_start_f);
+              float span = (dir == 1) ? (target - start) : (start - target);
+              if (span < 0.3f) {
+                id(steer_episode_active) = false;
+                id(steer_episode_dir) = 0;
+                id(steer_episode_standing_byte) = -1;
+                ESP_LOGI(TAG, "episode void: span %.2f F too small - treated as settled", span);
+                return;
+              }
+              float progress = (dir == 1) ? (t_s_f - start) / span : (start - t_s_f) / span;
+              float threshold = id(anticipation_pct).state / 100.0f;
+              ESP_LOGI(TAG, "episode: T_s=%.1f F target=%.1f F desired=%d stored=%d progress=%.0f%%",
+                       t_s_f, target, desired, stored, progress * 100.0f);
+              if (progress >= threshold) {
+                // CUTOFF: undo the episode's boost — restore the byte
+                // stored when the episode started (see the header for
+                // why this replaces a wall-temp cutoff).
+                int standing = id(steer_episode_standing_byte);
+                if (standing < 0) standing = stored;
+                int ph, pc;
+                build_pair(standing, ph, pc);
+                if (ph != stored_heat || pc != stored_cool) {
+                  if (id(infinitesp_hub).write_activity_pair(4, (uint8_t) ph, (uint8_t) pc)) {
+                    ESP_LOGI(TAG, "CUTOFF at progress %.0f%%: pair -> heat %d cool %d (boost undone); coast 120 s",
+                             progress * 100.0f, ph, pc);
+                  } else {
+                    ESP_LOGW(TAG, "CUTOFF write refused by a hub guard - coast entered anyway");
+                  }
+                } else {
+                  ESP_LOGI(TAG, "CUTOFF at progress %.0f%%: standing byte already stored, no write; coast 120 s",
+                           progress * 100.0f);
+                }
+                id(steer_episode_active) = false;
+                id(steer_coast) = true;
+                id(steer_coast_until_epoch) = now_ts + 120;
+                id(steer_restore_done) = false;
+                return;
+              }
+              // No cutoff yet: fall through to the normal steered write.
+            }
+          }
+          // (8) NORMAL STEERED WRITE — one pair frame, or none.
+          if (!id(steer_episode_active) && fabsf(t_s_f - target) <= 0.7f && desired == stored) {
+            ESP_LOGD(TAG, "settled: T_s=%.1f F target=%.1f F desired=%d stored=%d", t_s_f, target, desired, stored);
+            return;
+          }
+          {
+            int ph, pc;
+            build_pair(desired, ph, pc);
+            if (ph == stored_heat && pc == stored_cool) {
+              ESP_LOGD(TAG, "tick: T_s=%.1f F target=%.1f F desired=%d stored=%d - no write", t_s_f, target, desired, stored);
+              return;
+            }
+            if (id(infinitesp_hub).write_activity_pair(4, (uint8_t) ph, (uint8_t) pc)) {
+              ESP_LOGI(TAG, "steer: T_s=%.1f F target=%.1f F -> pair heat %d cool %d (stored heat=%d cool=%d)",
+                       t_s_f, target, ph, pc, stored_heat, stored_cool);
+            } else {
+              ESP_LOGW(TAG, "steer write refused by a hub guard");
+            }
+          }
+
+# ============================================================
+# FAN CIRCULATION WITH CALL ACCOUNTING (60 s tick).
+# The hourly target is a BUDGET: minutes the
+# blower already ran on real calls this hour are CREDITED
+# toward "Fan Minutes Per Hour", and circulation tops up only
+# the missing minutes, whenever in the hour they are missing.
+# (This is how the serial thermostats account circulation:
+# ecobee's Fan Min On Time counts call minutes too.)
+# Call detection is passive: a running
+# compressor is a cool call; a turning blower with the fan
+# byte at AUTO and no ownership is a heat call. A heat call
+# that starts while OUR Low is on the byte is indistinguishable
+# from our own circulation by these signals - its minutes are
+# then counted as circulation minutes instead of credit. The
+# miscount is bounded by the target and benign.
+# Ownership rules: claim AUTO -> LOW only
+# if the byte is AUTO and not ours; never touch the wall's own
+# Low/Med/High; restore AUTO only if we set the Low; ownership
+# in RAM so a reboot can't strand a restore. Byte 30 is still
+# behind BOTH switches (byte 30's first live test is still
+# an attended first test).
+# ============================================================
+  - interval: 60s
+    then:
+      - lambda: |-
+          const char *TAG = "fan_circ";
+          int now_ts = (int) id(ha_time).now().timestamp;
+          if (now_ts < 1700000000) return;  // clock not synced yet
+          int hour = now_ts / 3600;
+          if (hour != id(circ_last_hour)) {
+            id(circ_last_hour) = hour;
+            id(circ_credit_min) = 0;
+            id(circ_ran_min) = 0;
+          }
+          int fan = id(infinitesp_hub).get_activity_fan(4);
+          if (fan < 0) return;  // row not cached yet
+          int comp = id(infinitesp_hub).get_compressor_state();
+          int rpm = id(infinitesp_hub).get_blower_rpm();
+          int target = (int) id(fan_minutes).state;
+          bool gates = id(fan_circ_switch).state && id(fan_enable_switch).state;
+          if (id(fan_we_set_it)) {
+            // We own the fan byte (LOW). Never touch the byte
+            // while a call drives the blower: a
+            // compressor minute counts as call credit and we
+            // simply keep ownership until the call ends.
+            if (comp == 1) {
+              if (id(circ_credit_min) < 60) id(circ_credit_min)++;
+              return;
+            }
+            if (id(circ_ran_min) < 60) id(circ_ran_min)++;
+            int have_o = id(circ_credit_min) + id(circ_ran_min);
+            if (!gates || have_o >= target) {
+              if (fan == 1) id(infinitesp_hub).write_activity_fan(4, 0);
+              id(fan_we_set_it) = false;
+              ESP_LOGI(TAG, "circulation stop (credit %d + ran %d of target %d): ownership cleared%s",
+                       id(circ_credit_min), id(circ_ran_min), target,
+                       fan == 1 ? ", manual fan restored to AUTO" : "");
+            }
+            return;
+          }
+          // Not ours. A call minute is credited and circulation
+          // stays out of the way.
+          bool call = (comp == 1) || (rpm > 0 && fan == 0);
+          if (call) {
+            if (id(circ_credit_min) < 60) id(circ_credit_min)++;
+            return;
+          }
+          if (!gates) return;
+          int have = id(circ_credit_min) + id(circ_ran_min);
+          if (have >= target) return;  // hour already satisfied by calls
+          if (fan == 0) {
+            if (id(infinitesp_hub).write_activity_fan(4, 1)) {
+              id(fan_we_set_it) = true;
+              ESP_LOGI(TAG, "circulation start: manual fan AUTO -> LOW (credit %d + ran %d < target %d)",
+                       id(circ_credit_min), id(circ_ran_min), target);
+            }
+          }
+          // fan == 1 && !ours: the wall's own Low runs the fan
+          // continuously - circulation is satisfied, leave it.
+          // fan == 2/3: the wall's Med/High - never written.
+
+# ============================================================
+# DEAD-MAN RETURN (60 s tick). The sensorless half
+# of the research's freeze/stranding protection: freeze
+# MONITORING needs an indoor temperature (no sensors yet),
+# but a setpoint STRANDED by a dead controller does not.
+# Semantics: while the "Dead-man Return" switch is on, if the
+# HA heartbeat (written by home-assistant.yaml every 5 min) is
+# older than "Dead-man Hours" AND the stored manual pair sits
+# outside the safe band (heat 60-72 F, cool 74-85 F), write
+# the baseline pair 68/78 through the guarded write-core -
+# once per outage (the flag re-arms when the heartbeat is
+# fresh again). A pair already inside the band is left alone:
+# nothing is stranded. The age is judged on the SNTP clock,
+# independent of HA. The heartbeat must have been received at
+# least once since boot, so a node whose HA package was never
+# installed can never fire. All hub guards still apply: on a
+# dead bus the write is refused and retried next tick.
+# ============================================================
+  - interval: 60s
+    then:
+      - lambda: |-
+          const char *TAG = "deadman";
+          if (!id(deadman_switch).state) {
+            id(deadman_fired) = false;
+            return;
+          }
+          int now_ts = (int) id(sntp_time).now().timestamp;
+          if (now_ts < 1700000000) return;  // SNTP not synced yet
+          int hb = id(ha_heartbeat_epoch);
+          if (hb == 0) return;  // never armed: no heartbeat since boot
+          int age = now_ts - hb;
+          int limit = (int) id(deadman_hours).state * 3600;
+          if (age < limit) {
+            id(deadman_fired) = false;
+            return;
+          }
+          if (id(deadman_fired)) return;  // once per outage
+          int sh = id(infinitesp_hub).get_activity_heat_f(4);
+          int sc = id(infinitesp_hub).get_activity_cool_f(4);
+          if (sh < 0 || sc < 0) return;  // row not cached yet
+          if (sh >= 60 && sh <= 72 && sc >= 74 && sc <= 85) return;  // inside the safe band
+          if (id(infinitesp_hub).write_activity_pair(4, 68, 78)) {
+            id(deadman_fired) = true;
+            ESP_LOGW(TAG, "heartbeat %d s old (limit %d s): manual pair %d/%d outside safe band -> baseline 68/78 written",
+                     age, limit, sh, sc);
+          } else {
+            ESP_LOGW(TAG, "baseline write refused by a hub guard (heartbeat %d s old) - will retry", age);
+          }
+
+# ============================================================
+# BUS HEALTH PUBLISHER (30 s) — drives the "Bus Healthy"
+# template binary sensor. Publish-only, like the read-back
+# sync: publish_state() has no path to the bus.
+# ============================================================
+  - interval: 30s
+    then:
+      - lambda: |-
+          id(bus_healthy_bs).publish_state(id(infinitesp_hub).bus_healthy());

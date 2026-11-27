@@ -1,0 +1,450 @@
+import esphome.codegen as cg
+import esphome.config_validation as cv
+import logging
+from esphome import pins
+from esphome.components import uart
+from esphome.components import time
+from esphome.const import CONF_ID
+from esphome.core import CORE
+
+_LOGGER = logging.getLogger(__name__)
+
+CODEOWNERS = ["@nebulous"]
+DEPENDENCIES = ["uart"]
+AUTO_LOAD = ["climate", "sensor", "select", "text_sensor", "binary_sensor", "cover", "datetime", "number", "button"]
+MULTI_CONF = True
+
+CONF_INFINITESP_ID = "infinitesp_id"
+CONF_STATUS_LIGHT_ID = "status_light_id"
+CONF_STATUS_LED_PIN = "status_led_pin"
+
+infinitesp_ns = cg.esphome_ns.namespace("infinitesp")
+InfinitESPComponent = infinitesp_ns.class_("InfinitESPComponent", cg.Component, uart.UARTDevice)
+InfinitESPEntity = infinitesp_ns.class_("InfinitESPEntity")
+
+# Automation action `infinitesp.sync_clock` (clock phase 3): manual sync
+# from yaml automations / HA device actions. Shares the hub's sync core with
+# sam_ascii TIME!NOW and the auto-spawned Sync Thermostat Clock button.
+import esphome.automation as automation
+from esphome.automation import Action, maybe_simple_id
+
+SyncClockAction = infinitesp_ns.class_("SyncClockAction", Action)
+SYNC_CLOCK_ACTION_SCHEMA = maybe_simple_id(
+    {
+        cv.Required(CONF_ID): cv.use_id(InfinitESPComponent),
+    }
+)
+
+
+@automation.register_action(
+    "infinitesp.sync_clock", SyncClockAction, SYNC_CLOCK_ACTION_SCHEMA, synchronous=True
+)
+async def sync_clock_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    return cg.new_Pvariable(action_id, template_arg, paren)
+
+CONF_SAM_ADDRESS = "sam_address"
+# ESPHome time source for the sam_ascii TIME!NOW verb (clock phase 2).
+# Explicit override; defaults to the first declared time: platform.
+CONF_TIME_ID = "time_id"
+CONF_ADDRESS = "address"  # deprecated alias for sam_address
+CONF_IDU_ADDRESS = "idu_address"
+CONF_ODU_ADDRESS = "odu_address"
+CONF_FLOW_CONTROL_PIN = "flow_control_pin"
+CONF_ZONE_CONTROLLER_ADDRESS = "zone_controller_address"
+CONF_TEMPERATURE_UNIT = "temperature_unit"
+
+# NIM emulation (branch-local experiment). nim_address is the enable switch
+# (0 = disabled, matching sam_address/zone_controller_address); everything
+# else lives in the nim: sub-block.
+CONF_NIM_ADDRESS = "nim_address"
+CONF_NIM = "nim"
+CONF_DEFROST_SENSOR = "defrost_sensor"
+CONF_ON_HEAT_STAGE = "on_heat_stage"
+CONF_ON_COOL_STAGE = "on_cool_stage"
+CONF_ON_DEFROST = "on_defrost"
+
+# ZC zone sensor reference configuration
+CONF_ZC_ZONE_2 = "zc_zone_2"
+CONF_ZC_ZONE_3 = "zc_zone_3"
+CONF_ZC_ZONE_4 = "zc_zone_4"
+CONF_ZC_ZONE_5 = "zc_zone_5"   # secondary controller (0x61), local zone 1
+CONF_ZC_ZONE_6 = "zc_zone_6"   # secondary controller (0x61), local zone 2
+CONF_ZC_ZONE_7 = "zc_zone_7"   # secondary controller (0x61), local zone 3
+CONF_ZC_ZONE_8 = "zc_zone_8"   # secondary controller (0x61), local zone 4
+# ZC thermistor sensor references (register 0302 ids 0x14/0x1C = LAT/HPT)
+CONF_ZC_LAT = "zc_lat"
+CONF_ZC_HPT = "zc_hpt"
+CONF_TEMPERATURE_SENSOR = "temperature_sensor"
+CONF_STALENESS_TIMEOUT = "staleness_timeout"
+CONF_SENSOR_UNIT = "sensor_unit"
+
+ZC_ZONE_SCHEMA = cv.Schema({
+    cv.Optional(CONF_TEMPERATURE_SENSOR): cv.use_id("sensor"),
+    cv.Optional(CONF_STALENESS_TIMEOUT, default=120): cv.positive_int,
+    cv.Optional(CONF_SENSOR_UNIT): cv.one_of("C", "F"),
+})
+
+TEMP_UNIT_AUTO = "auto"
+TEMP_UNIT_FAHRENHEIT = "F"
+TEMP_UNIT_CELSIUS = "C"
+
+# NIM sub-block: one device, one block (mirrors the zc_zone_N sub-block idiom
+# for the sensor reference; triggers follow the cover platform's on_change
+# mechanism). Triggers fire on change with the new value as `x`.
+NIM_SCHEMA = cv.Schema(
+    {
+        # Binary sensor feeding the HP defrost signal into 0316[14]
+        # (e.g. defrost board output via optocoupler).
+        cv.Optional(CONF_DEFROST_SENSOR): cv.use_id("binary_sensor"),
+        cv.Optional(CONF_ON_HEAT_STAGE): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_COOL_STAGE): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_DEFROST): automation.validate_automation(single=True),
+    }
+)
+
+
+def _validate_zc_config(config):
+    """Warn on ZC sensor misconfiguration."""
+    # Zone refs fall back to zone-1 ambient when stale; thermistor refs (LAT/HPT)
+    # revert to not-installed. Either way a missing sensor_unit risks a wrong
+    # conversion, so warn for all of them.
+    sensor_keys = [CONF_ZC_ZONE_2, CONF_ZC_ZONE_3, CONF_ZC_ZONE_4,
+                  CONF_ZC_ZONE_5, CONF_ZC_ZONE_6, CONF_ZC_ZONE_7, CONF_ZC_ZONE_8,
+                  CONF_ZC_LAT, CONF_ZC_HPT]
+    for key in sensor_keys:
+        if key not in config:
+            continue
+        if config.get(CONF_ZONE_CONTROLLER_ADDRESS, 0) == 0:
+            _LOGGER.warning("'%s' configured but zone_controller_address is 0; ZC emulation disabled", key)
+        # A sensor's native unit is independent of the bus; defaulting to the
+        # system unit is a guess. It's caught at runtime by the plausibility
+        # check (40-99°F band for zones, -40-250°F for LAT/HPT), but warn so
+        # users set sensor_unit explicitly and avoid mis-conversion in the first
+        # place.
+        if CONF_TEMPERATURE_SENSOR in config[key] and CONF_SENSOR_UNIT not in config[key]:
+            _LOGGER.warning(
+                "'%s.temperature_sensor' has no 'sensor_unit'; defaulting to the system "
+                "unit. A wrong guess is rejected at runtime (falls back to zone-1 ambient "
+                "for zones, or not-installed for LAT/HPT), but set 'sensor_unit: F' or "
+                "'sensor_unit: C' explicitly to avoid mis-conversion. Check the sensor's "
+                "published value to pick correctly.",
+                key)
+    return config
+
+
+def _validate_addresses(config):
+    """Handle address → sam_address deprecation and mutual exclusion."""
+    if CONF_ADDRESS in config:
+        if CONF_SAM_ADDRESS in config:
+            raise cv.Invalid("Specify 'sam_address' or 'address', not both")
+        _LOGGER.warning("'address' is deprecated, use 'sam_address' instead")
+        config[CONF_SAM_ADDRESS] = config.pop(CONF_ADDRESS)
+    config.setdefault(CONF_SAM_ADDRESS, 0x92)
+    return config
+
+
+def _validate_unit_addresses(config):
+    """Validate hub-pinned IDU/ODU addresses (0 = class matching, the default).
+
+    The class nibble is not a device-type key across installs (our furnace
+    0x40, a reported 0x3E furnace, a 0x30 node serving 3B0x elsewhere), so the
+    override pins an exact node. Reject addresses that can never be the unit;
+    warn on a probable swap (IDU in class 5 / ODU in class 4)."""
+    fixed = {
+        config.get(CONF_SAM_ADDRESS, 0x92): "sam_address",
+        config.get(CONF_ZONE_CONTROLLER_ADDRESS, 0): "zone_controller_address",
+        config.get(CONF_NIM_ADDRESS, 0): "nim_address",
+        0x20: "the thermostat address",
+        0xF1: "the broadcast address",
+    }
+    for key, label in ((CONF_IDU_ADDRESS, "idu_address"), (CONF_ODU_ADDRESS, "odu_address")):
+        addr = config.get(key, 0)
+        if addr == 0:
+            continue
+        role = "indoor" if key == CONF_IDU_ADDRESS else "outdoor"
+        if fixed.get(addr):
+            raise cv.Invalid(
+                f"{label} 0x{addr:02X} is {fixed[addr]}, which cannot be the {role} unit"
+            )
+        if key == CONF_IDU_ADDRESS and addr >> 4 == 5:
+            _LOGGER.warning(
+                "idu_address 0x%02X is in device class 5 (outdoor); did you mean odu_address?", addr
+            )
+        if key == CONF_ODU_ADDRESS and addr >> 4 == 4:
+            _LOGGER.warning(
+                "odu_address 0x%02X is in device class 4 (indoor); did you mean idu_address?", addr
+            )
+    return config
+
+
+def _validate_nim_config(config):
+    """Validate NIM config: address collisions and passive-mode shape."""
+    nim = config.get(CONF_NIM_ADDRESS, 0)
+    if nim == 0:
+        # A nim: block WITHOUT nim_address is the PASSIVE monitor surface
+        # (ZC-style class-8 observation, zero transmission); only the
+        # defrost input is meaningless without emulation.
+        if CONF_NIM in config and CONF_DEFROST_SENSOR in config[CONF_NIM]:
+            _LOGGER.warning(
+                "'nim: defrost_sensor' configured but nim_address is 0; "
+                "defrost input needs emulation - in passive mode defrost "
+                "arrives via observed 0316[14]"
+            )
+        return config
+
+    fixed = {
+        config.get(CONF_SAM_ADDRESS, 0x92): "sam_address",
+        0x20: "the thermostat address",
+        0xF1: "the broadcast address",
+    }
+    if config.get(CONF_ZONE_CONTROLLER_ADDRESS, 0) != 0:
+        fixed[config[CONF_ZONE_CONTROLLER_ADDRESS]] = "zone_controller_address"
+    # 0x93 is our passive-mode poll identity (ADDR_FAKESAM) unless the SAM
+    # itself sits there; emulating the NIM from our own poll source would
+    # garble discovery replies.
+    if config.get(CONF_SAM_ADDRESS, 0x92) != 0x93:
+        fixed.setdefault(0x93, "the ADDR_FAKESAM poll identity")
+    if fixed.get(nim):
+        raise cv.Invalid(f"nim_address 0x{nim:02X} is {fixed[nim]}")
+
+    _LOGGER.warning(
+        "nim_address 0x%02X: NIM emulation is experimental. Protocol shapes "
+        "match real SYSTXCCNIM01 captures and commissioning succeeded on an "
+        "Infinity Touch, but no other control model has been tested", nim
+    )
+    return config
+
+
+def _validate_status_led(config):
+    """Ensure status_light_id and status_led_pin are mutually exclusive."""
+    if CONF_STATUS_LIGHT_ID in config and CONF_STATUS_LED_PIN in config:
+        raise cv.Invalid("status_light_id and status_led_pin are mutually exclusive")
+    return config
+
+
+CONF_AUTO_DIAGNOSTICS = "auto_diagnostics"
+CONF_EXPERIMENTAL_HEAT_SOURCE_MODES = "experimental_heat_source_modes"
+
+
+def _validate_experimental_modes(config):
+    """Warn when the experimental heat-source mode options are enabled."""
+    if config.get(CONF_EXPERIMENTAL_HEAT_SOURCE_MODES):
+        _LOGGER.warning(
+            "experimental_heat_source_modes is enabled: emergency_heat/heat_pump "
+            "writes are experimental and unreliable. They do not select the heat "
+            "source on dual-fuel systems, and on some Next Gen thermostats the "
+            "heat_pump write turns the system off. Do not rely on them for control"
+        )
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(
+        {
+            cv.GenerateID(): cv.declare_id(InfinitESPComponent),
+            cv.Optional(CONF_ADDRESS): cv.int_range(min=0, max=255),
+            cv.Optional(CONF_SAM_ADDRESS): cv.int_range(min=0, max=255),
+            # ESPHome time source backing TIME!NOW (clock-set phase 2).
+            # Optional: when omitted, the hub adopts the first declared
+            # time: platform (bus_jsonl discovery idiom). No time source at
+            # all -> TIME!NOW refuses at runtime, never writes the clock.
+            cv.Optional(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
+            # Status LED: reference an existing light entity (e.g. WS2812 RGB)
+            cv.Optional(CONF_STATUS_LIGHT_ID): cv.use_id("light"),
+            # Status LED: shorthand for a simple LED on a GPIO pin
+            cv.Optional(CONF_STATUS_LED_PIN): pins.gpio_output_pin_schema,
+            # RS485 transmit enable pin (DE/RE control)
+            cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
+            # Zone controller emulation: set to 0x60 to emulate a SYSTXCC4ZC01
+            cv.Optional(CONF_ZONE_CONTROLLER_ADDRESS, default=0): cv.int_range(min=0, max=255),
+            # NIM emulation (experimental): set to 0x80 to emulate a
+            # SYSTXCCNIM01 bridging a non-communicating HP/ODU/HRV.
+            cv.Optional(CONF_NIM_ADDRESS, default=0): cv.int_range(min=0, max=255),
+            cv.Optional(CONF_NIM): NIM_SCHEMA,
+            # Pin the indoor/outdoor unit to an exact bus node (unset = default
+            # class matching). For installs whose unit sits off the assumed
+            # class nibble (4 = IDU, 5 = ODU), e.g. a furnace at 0x3E, or to
+            # keep a second class-5 node (a refrigerant board) out of ODU
+            # entities and slow polls.
+            cv.Optional(CONF_IDU_ADDRESS): cv.int_range(min=0, max=255),
+            cv.Optional(CONF_ODU_ADDRESS): cv.int_range(min=0, max=255),
+            # Temperature unit: auto (heuristic), F, or C
+            cv.Optional(CONF_TEMPERATURE_UNIT, default=TEMP_UNIT_AUTO): cv.one_of(TEMP_UNIT_AUTO, TEMP_UNIT_FAHRENHEIT, TEMP_UNIT_CELSIUS),
+            # Opt-out for the auto-generated diagnostic entity group
+            # (counters, tstat wifi/dealer strings, version, manufacture date,
+            # fault timestamp). Core and equipment-conditional entities always
+            # spawn; see auto_entities.py.
+            cv.Optional(CONF_AUTO_DIAGNOSTICS, default=True): cv.boolean,
+            # Opt-in for the emergency_heat/heat_pump system-mode options. Off
+            # by default: those mode writes do not select the heat source (the
+            # selection lives in the thermostat), and on Next Gen Infinity
+            # tstats the heat_pump write has been observed turning the system
+            # off (issue #18). Gated at set_system_mode(), the choke point for
+            # every input surface.
+            cv.Optional(CONF_EXPERIMENTAL_HEAT_SOURCE_MODES, default=False): cv.boolean,
+            # ZC zone temperature sensor references (requires zone_controller_address).
+            # Zones 2-4 are on the primary controller (0x60); 5-8 on a second
+            # controller at +1 (0x61). Zone 1 is always thermostat-direct.
+            cv.Optional(CONF_ZC_ZONE_2): ZC_ZONE_SCHEMA,
+            cv.Optional(CONF_ZC_ZONE_3): ZC_ZONE_SCHEMA,
+            cv.Optional(CONF_ZC_ZONE_4): ZC_ZONE_SCHEMA,
+            cv.Optional(CONF_ZC_ZONE_5): ZC_ZONE_SCHEMA,
+            cv.Optional(CONF_ZC_ZONE_6): ZC_ZONE_SCHEMA,
+            cv.Optional(CONF_ZC_ZONE_7): ZC_ZONE_SCHEMA,
+            cv.Optional(CONF_ZC_ZONE_8): ZC_ZONE_SCHEMA,
+            # ZC thermistor references (LAT/HPT). Same schema; when the fed
+            # sensor goes stale the entry reverts to not-installed (no ambient
+            # fallback, unlike zones).
+            cv.Optional(CONF_ZC_LAT): ZC_ZONE_SCHEMA,
+            cv.Optional(CONF_ZC_HPT): ZC_ZONE_SCHEMA,
+        }
+    ).extend(cv.COMPONENT_SCHEMA).extend(uart.UART_DEVICE_SCHEMA),
+    _validate_addresses,
+    _validate_unit_addresses,
+    _validate_nim_config,
+    _validate_status_led,
+    _validate_zc_config,
+    _validate_experimental_modes,
+)
+
+INFINITESP_DEVICE_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(CONF_INFINITESP_ID): cv.use_id(InfinitESPComponent),
+    }
+)
+
+
+# System-mode select options. The base four are reliable everywhere tested.
+# emergency_heat/heat_pump (mode nibbles 3/4) never select the heat source and
+# behave inconsistently across thermostat families, so they appear only when a
+# hub sets experimental_heat_source_modes. Read at to_code time from the hub
+# blocks because the select platform (auto-spawned or manual) only sees its own
+# config.
+BASE_SYSTEM_MODE_OPTIONS = ["heat", "cool", "auto", "off"]
+EXPERIMENTAL_SOURCE_MODE_OPTIONS = ["emergency_heat", "heat_pump"]
+
+
+def system_mode_options():
+    from esphome.core import CORE
+
+    blocks = CORE.config.get("infinitesp") or []
+    if any(isinstance(b, dict) and b.get(CONF_EXPERIMENTAL_HEAT_SOURCE_MODES)
+           for b in blocks):
+        return BASE_SYSTEM_MODE_OPTIONS + EXPERIMENTAL_SOURCE_MODE_OPTIONS
+    return list(BASE_SYSTEM_MODE_OPTIONS)
+
+
+async def register_infinitesp_entity(var, config):
+    parent = await cg.get_variable(config[CONF_INFINITESP_ID])
+    cg.add(parent.register_entity(var))
+    cg.add(var.set_parent(parent))
+
+
+async def to_code(config):
+    var = cg.new_Pvariable(config[CONF_ID])
+    cg.add(var.set_sam_address(config[CONF_SAM_ADDRESS]))
+    # Time source for TIME!NOW (phase 2): explicit time_id: wins, else the
+    # first declared time: platform (same config-time discovery bus_jsonl
+    # uses for JSONL timestamps). Absent both, the pointer stays null and
+    # TIME!NOW refuses at runtime - an unvalidated clock is never written.
+    time_id = config.get(CONF_TIME_ID)
+    if time_id is None:
+        time_platforms = CORE.config.get("time", [])
+        if time_platforms:
+            time_id = time_platforms[0][CONF_ID]
+    if time_id is not None:
+        time_var = await cg.get_variable(time_id)
+        cg.add(var.set_time_source(time_var))
+    # Unit pins: only emit when set — the default (class matching) keeps
+    # generated code identical to configs written before these keys existed.
+    if config.get(CONF_IDU_ADDRESS, 0) != 0:
+        cg.add(var.set_idu_address(config[CONF_IDU_ADDRESS]))
+    if config.get(CONF_ODU_ADDRESS, 0) != 0:
+        cg.add(var.set_odu_address(config[CONF_ODU_ADDRESS]))
+
+    if config[CONF_ZONE_CONTROLLER_ADDRESS] != 0:
+        cg.add(var.set_zc_address(config[CONF_ZONE_CONTROLLER_ADDRESS]))
+
+    # NIM emulation: address enables it; the nim: block wires the defrost
+    # input and the hardware-control event triggers (ZC-cover style — user
+    # yaml supplies the actuation code).
+    if config[CONF_NIM_ADDRESS] != 0:
+        cg.add(var.set_nim_address(config[CONF_NIM_ADDRESS]))
+    nim_cfg = config.get(CONF_NIM)
+    if nim_cfg:
+        if CONF_DEFROST_SENSOR in nim_cfg:
+            bs = await cg.get_variable(nim_cfg[CONF_DEFROST_SENSOR])
+            cg.add(var.set_nim_defrost_sensor(bs))
+        for key, getter, arg in (
+            (CONF_ON_HEAT_STAGE, var.get_nim_heat_stage_trigger, (cg.int_, "x")),
+            (CONF_ON_COOL_STAGE, var.get_nim_cool_stage_trigger, (cg.int_, "x")),
+            (CONF_ON_DEFROST, var.get_nim_defrost_trigger, (bool, "x")),
+        ):
+            if key in nim_cfg:
+                await automation.build_automation(getter(), [arg], nim_cfg[key])
+
+    cg.add(var.set_experimental_heat_source_modes(config[CONF_EXPERIMENTAL_HEAT_SOURCE_MODES]))
+
+    # Wire up ZC zone temperature sensor references. Zones 2-4 → primary
+    # controller (0x60); 5-8 → secondary controller (0x61).
+    for zone_num, zone_key in [(2, CONF_ZC_ZONE_2), (3, CONF_ZC_ZONE_3), (4, CONF_ZC_ZONE_4),
+                               (5, CONF_ZC_ZONE_5), (6, CONF_ZC_ZONE_6),
+                               (7, CONF_ZC_ZONE_7), (8, CONF_ZC_ZONE_8)]:
+        if zone_key in config:
+            zone_cfg = config[zone_key]
+            if CONF_TEMPERATURE_SENSOR in zone_cfg:
+                sens = await cg.get_variable(zone_cfg[CONF_TEMPERATURE_SENSOR])
+                cg.add(var.set_zc_temperature_sensor(zone_num, sens))
+                # Explicit sensor_unit overrides the default (inherit from bus)
+                if CONF_SENSOR_UNIT in zone_cfg:
+                    is_f = zone_cfg[CONF_SENSOR_UNIT] == "F"
+                    cg.add(var.set_zc_sensor_is_fahrenheit(zone_num, is_f))
+            timeout = zone_cfg.get(CONF_STALENESS_TIMEOUT, 120)
+            cg.add(var.set_zc_staleness_timeout(zone_num, timeout * 1000))
+
+    # Wire up ZC thermistor references (LAT/HPT) — feeds external ESPHome
+    # sensors into register 0302 ids 0x14/0x1C. Emulation only.
+    for key, set_sensor, set_unit, set_stale in [
+        (CONF_ZC_LAT, var.set_zc_lat_sensor, var.set_zc_lat_is_fahrenheit, var.set_zc_lat_staleness),
+        (CONF_ZC_HPT, var.set_zc_hpt_sensor, var.set_zc_hpt_is_fahrenheit, var.set_zc_hpt_staleness),
+    ]:
+        if key not in config:
+            continue
+        tcfg = config[key]
+        if CONF_TEMPERATURE_SENSOR in tcfg:
+            sens = await cg.get_variable(tcfg[CONF_TEMPERATURE_SENSOR])
+            cg.add(set_sensor(sens))
+            if CONF_SENSOR_UNIT in tcfg:
+                cg.add(set_unit(tcfg[CONF_SENSOR_UNIT] == "F"))
+        cg.add(set_stale(tcfg.get(CONF_STALENESS_TIMEOUT, 120) * 1000))
+
+    temp_unit = config[CONF_TEMPERATURE_UNIT]
+    if temp_unit == TEMP_UNIT_AUTO:
+        cg.add(var.set_temperature_unit(cg.RawExpression("infinitesp::TemperatureUnit::AUTO")))
+    elif temp_unit == TEMP_UNIT_FAHRENHEIT:
+        cg.add(var.set_temperature_unit(cg.RawExpression("infinitesp::TemperatureUnit::FAHRENHEIT")))
+    elif temp_unit == TEMP_UNIT_CELSIUS:
+        cg.add(var.set_temperature_unit(cg.RawExpression("infinitesp::TemperatureUnit::CELSIUS")))
+
+    if CONF_STATUS_LED_PIN in config:
+        pin = await cg.gpio_pin_expression(config[CONF_STATUS_LED_PIN])
+        cg.add(var.set_status_led_pin(pin))
+        cg.add_define("USE_INFINITESP_STATUS_LED_PIN")
+
+    if CONF_FLOW_CONTROL_PIN in config:
+        pin = await cg.gpio_pin_expression(config[CONF_FLOW_CONTROL_PIN])
+        cg.add(var.set_flow_control_pin(pin))
+        cg.add_define("USE_INFINITESP_FLOW_CONTROL_PIN")
+
+    if CONF_STATUS_LIGHT_ID in config:
+        light_var = await cg.get_variable(config[CONF_STATUS_LIGHT_ID])
+        cg.add(var.set_status_light(light_var))
+        cg.add_define("USE_INFINITESP_STATUS_LIGHT")
+
+    await cg.register_component(var, config)
+    await uart.register_uart_device(var, config)
+
+    from . import auto_entities
+
+    await auto_entities.spawn_system_entities(config)

@@ -1,0 +1,31 @@
+This repository contains and builds upon the following third-party works:
+
+InfinitESP — ESPHome System Access Module implementation for the
+Carrier/Bryant Infinity RS-485 bus.
+  Copyright (c) 2022 nebulous
+  License: MIT (full text vendored at firmware/phase5-components/infinitesp/LICENSE
+  and firmware/control-components/infinitesp/LICENSE)
+  Source: https://github.com/nebulous/infinitesp
+  The ESPHome component sets under firmware/*-components/ are derived from
+  InfinitESP; the infinitesp component itself is vendored from upstream.
+
+infinitive — SAM register layout documentation/code.
+  Copyright (c) 2016 Andrew Danforth
+  License: MIT
+  Source: https://github.com/lurgh/infinitive
+  Referenced by docs/research/infinitive-registers.md; no code copied.
+
+gofinity — Bryant Evolution protocol implementation and boot capture.
+  Copyright (c) Bryan Varner
+  License: MIT
+  Source: https://github.com/bvarner/gofinity
+  The boot capture was used as an independent verification corpus;
+  see docs/research/gofinity-bootup.md. The capture file itself is not
+  redistributed here.
+
+ESPHome — the firmware framework all configurations target.
+  Source: https://esphome.io
+
+Carrier, Bryant, Heil, Infinity and Ion are trademarks of their respective
+owners. This is an independent interoperability research project, not
+affiliated with or endorsed by Carrier Corporation or ICP.

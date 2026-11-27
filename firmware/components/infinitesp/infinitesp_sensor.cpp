@@ -1,0 +1,594 @@
+#include "infinitesp_sensor.h"
+#include <cstring>
+#include <cinttypes>
+
+namespace esphome {
+namespace infinitesp {
+
+void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register_key) {
+  float value = NAN;
+
+  // Generic raw_register sensor: match the user-configured device+register exactly,
+  // then decode per datatype/scale (or a full-frame lambda). Surfaces arbitrary bus
+  // fields the curated sensors don't cover (e.g. older/cooling-only ODU families).
+  if (sensor_type_ == "raw_register") {
+    if (device_addr != raw_device_ || register_key != raw_register_)
+      return;
+    const auto *data = parent_->get_register(raw_device_, raw_register_);
+    if (data == nullptr)
+      return;
+
+    if (raw_lambda_) {
+      value = raw_lambda_(*data);
+    } else if (!raw_datatype_.empty()) {
+      size_t o = raw_offset_;
+      if (o >= data->size())
+        return;
+      auto be16 = [&](size_t i) -> uint16_t {
+        return (uint16_t) (((*data)[i] << 8) | (*data)[i + 1]);
+      };
+      auto be32 = [&](size_t i) -> uint32_t {
+        return ((uint32_t) (*data)[i] << 24) | ((uint32_t) (*data)[i + 1] << 16) |
+               ((uint32_t) (*data)[i + 2] << 8) | (uint32_t) (*data)[i + 3];
+      };
+      if (raw_datatype_ == "uint8") {
+        value = (float) (*data)[o];
+      } else if (raw_datatype_ == "int8") {
+        value = (float) (int8_t) (*data)[o];
+      } else if (raw_datatype_ == "uint16_be") {
+        if (o + 1 >= data->size())
+          return;
+        value = (float) be16(o);
+      } else if (raw_datatype_ == "int16_be") {
+        if (o + 1 >= data->size())
+          return;
+        value = (float) (int16_t) be16(o);
+      } else if (raw_datatype_ == "uint32_be") {
+        if (o + 3 >= data->size())
+          return;
+        value = (float) be32(o);
+      } else if (raw_datatype_ == "int32_be") {
+        if (o + 3 >= data->size())
+          return;
+        value = (float) (int32_t) be32(o);
+      } else if (raw_datatype_ == "f32_be") {
+        if (o + 3 >= data->size())
+          return;
+        uint32_t u = be32(o);
+        float f;
+        memcpy(&f, &u, sizeof(f));
+        value = f;
+      } else {
+        return;  // unknown datatype
+      }
+      value *= raw_scale_;
+    } else {
+      return;  // no datatype and no lambda (config validation should prevent this)
+    }
+
+    if (raw_has_range_ && (value < raw_min_ || value > raw_max_))
+      return;  // out of plausibility range (guards the unpopulated-register footgun)
+    publish_state(value);
+    return;
+  }
+
+  // SAM state registers (3B02): temperature, humidity, outdoor temp
+  if (register_key == REG_SAM_STATE) {
+    auto *data = parent_->get_register(parent_->get_sam_address(), REG_SAM_STATE);
+    if (!data || data->size() < 21)
+      return;
+
+    if (sensor_type_ == "outdoor_temperature") {
+      // Issue #53: prefer the ODU's own sensor at /16 °F resolution. The 3B02
+      // byte is quantized to the tstat display unit (whole °C in °C mode),
+      // which staircases HA history while the cloud shows 0.5 °C steps. The
+      // ODU value can sit ~0.3 °C from the 3B02 byte (same physical sensor,
+      // different sampling and rounding). Documented, never compensated.
+      // Falls back to 3B02 whenever the ODU data is absent or stale; passive
+      // installs whose tstat never polls the ODU temp tables stay on 3B02
+      // forever, which is exactly today's behavior.
+      float fine = parent_->odu_outdoor_temp_c_();
+      if (!std::isnan(fine)) {
+        if (!outdoor_source_odu_) {
+          outdoor_source_odu_ = true;
+          ESP_LOGI("InfinitESP", "Outdoor Temperature: using ODU fine source (/16 F)");
+        }
+        value = fine;
+      } else {
+        if (outdoor_source_odu_) {
+          outdoor_source_odu_ = false;
+          ESP_LOGI("InfinitESP", "Outdoor Temperature: ODU source stale/absent, falling back to 3B02");
+        }
+        value = parent_->bus_temp_to_celsius((float) data->at(REG3B02_OUTDOOR_TEMP));
+      }
+    } else if (sensor_type_ == "temperature") {
+      uint8_t idx = zone_ - 1;
+      if (data->at(REG3B02_ACTIVE_ZONES) & (1 << idx)) {
+        value = parent_->bus_temp_to_celsius((float) data->at(REG3B02_TEMPS + idx));
+        // Issue #53: prefer 3D02's raw 1/16 °F reading when the tstat serves
+        // that register. The 3B02 byte is quantized to the display unit
+        // (whole °C in °C mode), which staircases HA history while the cloud
+        // shows 0.5 °C steps. ITC-line controls refuse 3D02 (dropped by the
+        // poll backoff) and keep this fallback forever. The 5 °C divergence
+        // guard protects against wrong-unit semantics on serving °C tstats,
+        // which is unverified until a °C rig serves the register.
+        float fine = parent_->tstat_zone_temp_c_(zone_);
+        if (!std::isnan(fine) && std::fabs(fine - value) <= 5.0f)
+          value = fine;
+      }
+    } else if (sensor_type_ == "humidity") {
+      uint8_t idx = zone_ - 1;
+      if (data->at(REG3B02_ACTIVE_ZONES) & (1 << idx)) {
+        value = (float) data->at(REG3B02_HUMIDITY + idx);
+      }
+    }
+  }
+
+  // fault_timestamp: state = epoch time the newest fault-log entry was logged
+  // (observation lag applies: 4202 arrives via the slow-poll rotation, so a birth
+  // can be seen up to one rotation late; the VALUE is the true logging time).
+  // Age math is bus-relative (entry fields + day trailer + SAM 3B02 bus clock),
+  // then anchored to the ESPHome time source. No liveness exists on the bus; see
+  // the 0x4202 layout block in infinitesp.h (issue #22).
+  if (sensor_type_ == "fault_timestamp" && register_key == REG_TSTAT_FAULTS) {
+    auto *faults = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_FAULTS);
+    auto *state = parent_->get_register(parent_->get_sam_address(), REG_SAM_STATE);
+    if (faults && faults->size() >= FAULT_REG_SIZE && state &&
+        state->size() >= REG3B02_MINUTES + 2) {
+      uint16_t now_bus_min = ((uint16_t) state->at(REG3B02_MINUTES) << 8) |
+                             state->at(REG3B02_MINUTES + 1);
+      int32_t best_age = -1;
+      uint8_t best_code = 0, best_i = 0;
+      for (uint8_t i = 0; i < FAULT_ENTRY_COUNT; i++) {
+        if ((*faults)[i * FAULT_ENTRY_SIZE + FAULT_CODE] == 0 &&
+            (*faults)[i * FAULT_ENTRY_SIZE + FAULT_SOURCE] == 0)
+          continue;  // empty slot
+        if (!fault_entry_time_valid(*faults, i))
+          continue;  // garbage time fields (non-tstat source packing)
+        int32_t age = fault_entry_age_minutes(*faults, i, now_bus_min);
+        if (age < 0)
+          continue;
+        if (best_age < 0 || age < best_age) {
+          best_age = age;
+          best_code = (*faults)[i * FAULT_ENTRY_SIZE + FAULT_CODE];
+          best_i = i;
+        }
+      }
+      ESP_LOGD("InfinitESP", "fault_timestamp: newest entry code=%u age=%" PRId32 "min", best_code,
+               best_age);
+      if (best_age >= 0) {
+        // Publish only when the newest entry changes: the value depends on the
+        // 3B02 clock sample, which drifts vs wall time between rotations.
+        uint8_t bb = best_i * FAULT_ENTRY_SIZE;
+        uint32_t sig = (uint32_t) best_code |
+                       ((uint32_t) (*faults)[bb + FAULT_HOUR] << 8) |
+                       ((uint32_t) (*faults)[bb + FAULT_MINUTE] << 13) |
+                       (((uint32_t) (((*faults)[bb + FAULT_DAYS_HI] << 8) |
+                                     (*faults)[bb + FAULT_DAYS_LO]) & 0x1FFF) << 19);
+        bool sig_changed = !fault_sig_valid_ || sig != fault_last_sig_;
+        if (sig_changed) {
+          fault_sig_valid_ = true;
+          fault_last_sig_ = sig;
+          if (!epoch_provider_) {
+            if (!fault_time_warned_) {
+              fault_time_warned_ = true;
+              ESP_LOGW("InfinitESP", "fault_timestamp: no time_id configured; cannot publish. "
+                                     "Set time_id on the sensor to your time source.");
+            }
+          } else {
+            time_t now_epoch = epoch_provider_();  // 0 = not yet synced
+            if (now_epoch != 0) {
+              publish_state((float) now_epoch - (float) best_age * 60.0f);
+            } else if (!fault_time_warned_) {
+              fault_time_warned_ = true;
+              ESP_LOGW("InfinitESP", "fault_timestamp: time source not yet synced; publishing deferred");
+            }
+          }
+        }
+      }
+    }
+    return;  // handled; skip the generic publish below
+  }
+
+  // Thermostat vacation settings (4012). Vacation bytes are °C×2 in °C mode
+  // (half-degree), NOT whole-degree setpoints — vacation_byte_to_celsius is
+  // the dedicated accessor (roadmap °C bug #2; setpoint_to_celsius read them
+  // 2× high in °C mode).
+  if (register_key == REG_TSTAT_VACATION && sensor_type_ == "vacation_min_temp") {
+    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_VACATION);
+    if (data && data->size() >= 2)
+      value = parent_->vacation_byte_to_celsius(data->at(0));
+  }
+  if (register_key == REG_TSTAT_VACATION && sensor_type_ == "vacation_max_temp") {
+    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_VACATION);
+    if (data && data->size() >= 2)
+      value = parent_->vacation_byte_to_celsius(data->at(1));
+  }
+
+  // IDU (Indoor Unit) passively snooped registers
+  // Blower RPM from register 0306
+  if (register_key == REG_IDU_STATUS && sensor_type_ == "blower_rpm") {
+    auto *data = parent_->get_register(device_addr, REG_IDU_STATUS);
+    if (data) {
+      float rpm = parent_->idu_blower_rpm_(*data);
+      if (!std::isnan(rpm))
+        value = rpm;
+    }
+  }
+
+  // Airflow CFM from register 0316
+  if (register_key == REG_IDU_CONFIG && sensor_type_ == "airflow_cfm") {
+    auto *data = parent_->get_register(device_addr, REG_IDU_CONFIG);
+    if (data) {
+      float cfm = parent_->idu_airflow_cfm_(*data);
+      if (!std::isnan(cfm))
+        value = cfm;
+    }
+  }
+
+  // Accessory life used % from tstat 3B05 (0 = new, 100 = replace).
+  // 0xFF = accessory not configured -> publish nothing (unknown).
+  // Offsets per the REG3B05_* constants; the register is tstat-served and
+  // mirrored to the SAM address in every acquisition mode.
+  if (register_key == REG_SAM_ACCESSORIES &&
+      (sensor_type_ == "filter_level" || sensor_type_ == "uv_lamp_level" ||
+       sensor_type_ == "humidifier_pad_level" || sensor_type_ == "ventilator_filter_level")) {
+    uint8_t off = (sensor_type_ == "filter_level") ? REG3B05_FILTER :
+                  (sensor_type_ == "uv_lamp_level") ? REG3B05_UV :
+                  (sensor_type_ == "humidifier_pad_level") ? REG3B05_HUMIDIFIER : REG3B05_VENTILATOR;
+    auto *data = parent_->get_register(device_addr, REG_SAM_ACCESSORIES);
+    if (data && data->size() > off) {
+      uint8_t raw = (*data)[off];
+      if (raw != 0xFF) {
+        value = (float) raw;
+      } else {
+        // Accessory not configured (0xFF sentinel): explicit unknown, not a
+        // stale previous value.
+        publish_state(NAN);
+        return;
+      }
+    }
+  }
+
+  // Duct static pressure from register 0316 [7..8]: BE16 /65536 → inH2O.
+  // Class-4 gate above delivers only the IDU's 0316 — the emulated NIM's
+  // mirror (class 8) never reaches this branch.
+  if (register_key == REG_IDU_CONFIG && sensor_type_ == "idu_static_pressure") {
+    auto *data = parent_->get_register(device_addr, REG_IDU_CONFIG);
+    if (data) {
+      float sp = parent_->idu_static_pressure_(*data);
+      if (!std::isnan(sp))
+        value = sp;
+    }
+  }
+
+  // IDU heat stage from register 0316 byte 0: 0 off, 1/2/3 low/med/hi.
+  // Source-blind (gas burners on furnace gear, elements on fan-coil); the
+  // heat_source text sensor carries the interpretation, this carries the fact.
+  if (register_key == REG_IDU_CONFIG && sensor_type_ == "idu_heat_stage") {
+    auto *data = parent_->get_register(device_addr, REG_IDU_CONFIG);
+    if (data && !data->empty())
+      value = (float) ((*data)[0] & 0x0F);
+  }
+
+  // ODU (Outdoor Unit) passively snooped registers
+  // Compressor RPM from register 0604. Two uint16 BE pairs per stage:
+  //   target (commanded) at [0..1], actual (measured) at [2..3].
+  // See Infinitude OutdoorUnit.pm 0604 (target_rpm / current_rpm — Infinitude
+  // uses 'current' here but 'actual' elsewhere; InfinitESP unifies on 'actual').
+  if (register_key == REG_ODU_COMP_SPEED && sensor_type_ == "target_compressor_rpm") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_COMP_SPEED);
+    if (data) {
+      float rpm = parent_->odu_compressor_target_rpm_(*data);
+      if (!std::isnan(rpm))
+        value = rpm;
+    }
+  }
+  if (register_key == REG_ODU_COMP_SPEED && sensor_type_ == "compressor_rpm") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_COMP_SPEED);
+    if (data) {
+      float rpm = parent_->odu_compressor_actual_rpm_(*data);
+      if (!std::isnan(rpm))
+        value = rpm;
+    }
+  }
+
+  // Airflow the ODU requests from the IDU, register 0608 (uint16 BE at [5..6],
+  // CFM). Formerly decoded as compressor drive frequency (issue #7 disproved
+  // that reading). 'compressor_frequency' is the deprecated sensor-type alias.
+  if (register_key == REG_ODU_DEMAND && sensor_type_ == "odu_requested_cfm") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_DEMAND);
+    if (data) {
+      float cfm = parent_->odu_requested_cfm_(*data);
+      if (!std::isnan(cfm))
+        value = cfm;
+    }
+  }
+
+  // Expansion valve position from register 0608 byte [2] (0-100 percent).
+  // Expect 0 (off) or 100 (running) most of the time; brief ramps on cycle transitions.
+  if (register_key == REG_ODU_DEMAND && sensor_type_ == "odu_expansion_valve") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_DEMAND);
+    if (data) {
+      float v = parent_->odu_expansion_valve_(*data);
+      if (!std::isnan(v))
+        value = v;
+    }
+  }
+
+  // Variable-speed stage index from register 060e (byte 0: 0=off, 1..5=stage)
+  if (register_key == REG_ODU_STAGE_INFO && sensor_type_ == "odu_stage") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_STAGE_INFO);
+    if (data) {
+      float s = parent_->odu_stage_(*data);
+      if (!std::isnan(s))
+        value = s;
+    }
+  }
+
+  // Commanded compressor stage from register 0605 (float32 BE at [0..3]: 0.0/1.0..5.0)
+  // Write-only (thermostat→ODU); captured in handle_passive_frame_. Drives the
+  // actual stage (060e) with ~15s lag.
+  if (register_key == REG_ODU_CMD_STAGE && sensor_type_ == "odu_commanded_stage") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_CMD_STAGE);
+    if (data) {
+      float s = parent_->odu_commanded_stage_(*data);
+      if (!std::isnan(s))
+        value = s;
+    }
+  }
+
+
+  // ODU line voltage from register 0304 byte 7 (whole volts, state-independent).
+  // Validated against Carrier cloud linevolt: bus 238-240 vs cloud 239V.
+  if (register_key == REG_ODU_STATUS3 && sensor_type_ == "odu_line_voltage") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS3);
+    if (data) {
+      float v = parent_->odu_line_voltage_(*data);
+      if (!std::isnan(v))
+        value = v;
+    }
+  }
+
+  // ODU operating mode from register 0304 (byte 11 of payload, which is data[10])
+  if (register_key == REG_ODU_STATUS3 && sensor_type_ == "odu_operating_mode") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS3);
+    if (data) {
+      float mode = parent_->odu_operating_mode_(*data);
+      if (!std::isnan(mode))
+        value = mode;
+    }
+  }
+
+  // ODU IEEE754 float32 values from register 061f. idx 1..5 are DELTAS
+  // (superheat/subcooling/control ΔT), published in NATIVE °F (no conversion).
+  // These sensors have no device_class in yaml: HA's temperature conversion applies
+  // a +32 offset that corrupts deltas (3°F → 1.67°C → displayed 35°F).
+  // idx 6 is dimensionless.
+  // Layout via accessor odu_float_(idx): idx 1..6 at offset 1+(idx-1)*4.
+  //   1: superheat target  2: superheat actual  3: subcooling target
+  //   4: subcooling actual 5: discharge-related control delta (NOT discharge superheat -
+  //      refuted: it goes negative ~75% while running, impossible for superheat).
+  //      Likely a discharge-temp/superheat control deviation incorporating head
+  //      pressure. Exact identity unconfirmed. See Infinitude OutdoorUnit.pm 061F.
+  //   6: dimensionless constant
+  if (register_key == REG_ODU_FLOATS && sensor_type_.rfind("odu_float_", 0) == 0) {
+    auto *data = parent_->get_register(device_addr, REG_ODU_FLOATS);
+    if (data) {
+      int idx = sensor_type_[10] - '0';  // odu_float_N → N
+      if (idx >= 1 && idx <= 6) {
+        float fval = parent_->odu_float_(*data, idx);
+        if (!std::isnan(fval))
+          value = fval;  // idx 1..5 = native °F delta, idx 6 = dimensionless (no conversion)
+      }
+    }
+  }
+
+  // ODU registers 0302/0303: typed-TLV entries [u16 type, u16 value],
+  // value = raw/16. The type identifies the CHANNEL (0x130 "suction",
+  // 0x145 "discharge"); the quantity follows the register row: 0302 serves
+  // temperatures (F), 0303 serves pressures (PSI) - the same 0x130 code is
+  // suction line temp in 0302 and suction pressure in 0303. Screen-confirmed
+  // 2026-09-09 on a 24VNA948A while running: suction temp 58 F = 0302/0x130
+  // (57.9-60.7), suction pressure 135 PSI = 0303/0x130 (134-136), discharge
+  // temp 119 F = 0302/0x145 (119.0-119.8), superheat 12.0 = 0302/0x14A
+  // (10-13). Temperatures convert F->C for HA; superheat is a delta in
+  // native F with no device_class (HA's temp conversion adds +32, corrupting
+  // deltas); pressures publish native PSI (pressure conversion is
+  // multiplicative, safe for device_class).
+  // Superheat is sanity-banded 0..60 F: the 26VNA148 family serves two 0x14A
+  // entries with non-physical values (285.7-289.1 and 688-692.3 at /16,
+  // content unknown), which the band rejects instead of publishing garbage.
+  if (register_key == REG_ODU_STATUS1 || register_key == REG_ODU_STATUS2) {
+    auto *temps = parent_->get_register(device_addr, REG_ODU_STATUS1);  // temperature channels
+    auto *press = parent_->get_register(device_addr, REG_ODU_STATUS2);  // pressure channels
+    auto temp_tlv = [&](uint16_t type, uint8_t occ = 0) -> float {
+      if (temps && parent_->odu_tlv_populated_(*temps))
+        return parent_->odu_tlv_value_f_(*temps, type, occ);
+      return NAN;
+    };
+    auto press_tlv = [&](uint16_t type) -> float {
+      if (press && parent_->odu_tlv_populated_(*press))
+        return parent_->odu_tlv_value_f_(*press, type);
+      return NAN;
+    };
+    auto abs_temp = [&](float f) -> float { return std::isnan(f) ? NAN : (f - 32.0f) * (5.0f / 9.0f); };
+    // First-found-wins scan across candidate type codes: families serve the
+    // same quantity under different ids (suction line temp is 0x130 on the
+    // 24VNA9 family, 0x154 on the 26VNA148 family; discharge temp is 0x145 on
+    // both captured AC families, 0x140 on heat pumps per disc #232). Order
+    // by evidence weight. Do NOT alias semantically distinct types that
+    // share a label in the disc #232 table.
+    auto tlv_first = [&](std::initializer_list<uint16_t> types) -> float {
+      for (uint16_t t : types) {
+        float v = temp_tlv(t);
+        if (!std::isnan(v))
+          return v;
+      }
+      return NAN;
+    };
+
+    if (sensor_type_ == "odu_outdoor_temp") {
+      value = abs_temp(temp_tlv(ODU_TLV_OAT));
+    } else if (sensor_type_ == "odu_coil_temp") {
+      value = abs_temp(temp_tlv(ODU_TLV_OCT));
+    } else if (sensor_type_ == "odu_suction_temp") {
+      // 0x130 (24VNA9 family, screen-confirmed) then 0x154 (26VNA148 family)
+      value = abs_temp(tlv_first({ODU_TLV_OSP, ODU_TLV_SUCT}));
+    } else if (sensor_type_ == "odu_suction_superheat") {
+      float f = temp_tlv(ODU_TLV_SSH);
+      if (!std::isnan(f) && f >= 0.0f && f <= 60.0f)
+        value = f;  // dF published raw (no device_class)
+    } else if (sensor_type_ == "odu_discharge_temp") {
+      // 0x145 screen-confirmed on both captured AC families; 0x140 from the
+      // heat-pump table (disc #232).
+      value = abs_temp(tlv_first({ODU_TLV_DIS2, ODU_TLV_DIS}));
+    } else if (sensor_type_ == "odu_suction_pressure") {
+      value = press_tlv(ODU_TLV_OSP);  // native PSI
+    } else if (sensor_type_ == "odu_discharge_pressure") {
+      value = press_tlv(ODU_TLV_DSP);  // native PSI
+    }
+  }
+
+  // ODU register 3E01 (REG_ODU_3E_TEMPS, 2-stage/two-capacity family): int16
+  // BE /16 °F slots. slot0 = outdoor ambient, slot1 = coil temp. Unpopulated
+  // slots read 0x03FF and are rejected inside odu_3e_meas_f_. Absolute °F → °C.
+  // On variable-speed units this register never arrives (FUNC 0x15 refused),
+  // so this block is inert there and the table-03 block above feeds the same
+  // sensors. Panel-validated on a 24ANA160A (issue #21).
+  if (register_key == REG_ODU_3E_TEMPS) {
+    if (sensor_type_ == "odu_outdoor_temp" || sensor_type_ == "odu_coil_temp") {
+      uint8_t slot = (sensor_type_ == "odu_outdoor_temp") ? 0 : 1;
+      auto *data = parent_->get_register(device_addr, REG_ODU_3E_TEMPS);
+      if (data) {
+        float f = parent_->odu_3e_meas_f_(*data, slot);
+        if (!std::isnan(f))
+          value = (f - 32.0f) * (5.0f / 9.0f);
+      }
+    }
+  }
+
+  // ODU register 3E02 (REG_ODU_3E_STAGE, 2-stage/two-capacity family): stage
+  // byte >>1 → 0=off/1=low/2=high. Reply-fed only: the passive write capture
+  // skips 3E02 (issue #47 — on a single-stage 24ANB6 the tstat's write (02 =
+  // on) and the ODU's reply (04 = its one capacity) decode differently, and
+  // storing both under the ODU key flapped odu_stage 1/2 every poll cycle).
+  if (register_key == REG_ODU_3E_STAGE && sensor_type_ == "odu_stage") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_3E_STAGE);
+    if (data) {
+      float s = parent_->odu_3e_stage_(*data);
+      if (!std::isnan(s))
+        value = s;
+    }
+  }
+
+  // --- ZC register 0302 (REG_ZC_ZONE_STATUS) ---
+  // 24-byte TLV: six entries [tag, id, val_hi, val_lo] in id order
+  //   0x01 local-z1, 0x02 z2, 0x03 z3, 0x04 z4, 0x14 LAT, 0x1C HPT.
+  // tag 0x01 = present (value valid); 0x04 = not installed (0x0000).
+  // °F = uint16_BE / 16. Multi-ZC: system zone N maps to controller
+  // zc_addr_for_zone_(N) and LOCAL id zc_local_id_for_zone_(N) (zones 5-8 are
+  // local 1-4 on the secondary controller 0x61). LAT/HPT are thermistor ports
+  // on the primary controller (0x60). Only react to the controller that owns
+  // the wanted entry, and skip entries whose tag isn't present to avoid
+  // publishing 0°F → -17.8°C for uninstalled sensors.
+  if (register_key == REG_ZC_ZONE_STATUS) {
+    uint8_t want_id = 0;
+    uint8_t want_addr = 0;
+    if (sensor_type_ == "zc_zone_temperature") {
+      want_id = parent_->zc_local_id_for_zone_(zone_);
+      want_addr = parent_->zc_addr_for_zone_(zone_);
+    } else if (sensor_type_ == "zc_lat") {
+      want_id = ZC_ID_LAT;      // 0x14
+      want_addr = parent_->zc_addr_for_zone_(1);  // primary controller
+    } else if (sensor_type_ == "zc_hpt") {
+      want_id = ZC_ID_HPT;      // 0x1C
+      want_addr = parent_->zc_addr_for_zone_(1);  // primary controller
+    }
+    if (want_id != 0 && device_addr == want_addr) {
+      auto *data = parent_->get_register(device_addr, REG_ZC_ZONE_STATUS);
+      if (data && data->size() == 24) {
+        for (uint8_t e = 0; e + 3 < 24; e += 4) {
+          if (data->at(e + 1) == want_id && data->at(e) == ZC_0302_TAG_PRESENT) {
+            uint16_t raw = ((uint16_t) data->at(e + 2) << 8) | data->at(e + 3);
+            float temp_f = (float) raw / ZC_TEMP_SCALE;
+            value = (temp_f - 32.0f) * (5.0f / 9.0f);  // °F → °C for HA
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // --- Cycle counters and runtime hours (registers 0310/0311) ---
+  // Format: sequence of 4-byte entries: [key, b1, b2, b3]
+  // where value = (b1 << 16) | (b2 << 8) | b3 (24-bit unsigned)
+  //
+  // IDU keys: 0x23=low_heat, 0x24=high_heat, 0x48=med_heat,
+  //           0x2B=poweron, 0x2D=blower
+  // ODU keys: 0x23=heat, 0x28=cool, 0x3C=defrost, 0x2B=poweron
+  // _cycles = register 0310, _hours = register 0311
+  if (register_key == REG_IDU_CYCLES || register_key == REG_IDU_RUNTIME ||
+      register_key == REG_ODU_CYCLES || register_key == REG_ODU_RUNTIME) {
+    struct KVMap { const char *suffix; uint16_t reg; uint8_t key; };
+    static const KVMap kv_map[] = {
+      // IDU cycles (0310)
+      {"idu_low_heat_cycles",  REG_IDU_CYCLES,  0x23},
+      {"idu_high_heat_cycles", REG_IDU_CYCLES,  0x24},
+      {"idu_med_heat_cycles",  REG_IDU_CYCLES,  0x48},
+      {"idu_poweron_cycles",   REG_IDU_CYCLES,  0x2B},
+      {"idu_blower_cycles",    REG_IDU_CYCLES,  0x2D},
+      // IDU hours (0311)
+      {"idu_low_heat_hours",   REG_IDU_RUNTIME, 0x25},
+      {"idu_high_heat_hours",  REG_IDU_RUNTIME, 0x26},
+      {"idu_med_heat_hours",   REG_IDU_RUNTIME, 0x49},
+      {"idu_poweron_hours",    REG_IDU_RUNTIME, 0x2C},
+      {"idu_blower_hours",     REG_IDU_RUNTIME, 0x2E},
+      // ODU cycles (0310)
+      {"odu_heat_cycles",      REG_ODU_CYCLES,  0x23},
+      {"odu_cool_cycles",      REG_ODU_CYCLES,  0x28},
+      {"odu_defrost_cycles",   REG_ODU_CYCLES,  0x3C},
+      {"odu_poweron_cycles",   REG_ODU_CYCLES,  0x2B},
+      // ODU hours (0311)
+      {"odu_heat_hours",       REG_ODU_RUNTIME, 0x25},
+      {"odu_cool_hours",       REG_ODU_RUNTIME, 0x2A},
+      {"odu_defrost_hours",    REG_ODU_RUNTIME, 0x3D},
+      {"odu_poweron_hours",    REG_ODU_RUNTIME, 0x2C},
+    };
+
+    for (const auto &km : kv_map) {
+      if (sensor_type_ == km.suffix) {
+        auto *data = parent_->get_register(device_addr, km.reg);
+        if (data && data->size() >= 4) {
+          for (size_t i = 0; i + 3 < data->size(); i += 4) {
+            if ((*data)[i] == km.key) {
+              uint32_t val = ((uint32_t)(*data)[i+1] << 16) |
+                             ((uint32_t)(*data)[i+2] << 8) |
+                             (uint32_t)(*data)[i+3];
+              value = (float) val;
+              break;
+            }
+          }
+        }
+        break;
+      }
+    }
+  }
+  if (!std::isnan(value)) {
+    publish_state(value);
+  }
+}
+
+void InfinitESPSensor::on_register_dropped(uint8_t device_addr, uint16_t register_key) {
+  if (sensor_type_ != "fault_timestamp" || register_key != REG_TSTAT_FAULTS)
+    return;
+  if (fault_drop_published_)
+    return;
+  fault_drop_published_ = true;
+  ESP_LOGW("InfinitESP", "fault_timestamp: register 4202 dropped for this session - "
+           "this control serves no fault table (pre-cloud UIZ/UID?) - publishing no-data");
+  publish_state(NAN);
+}
+
+} // namespace infinitesp
+} // namespace esphome

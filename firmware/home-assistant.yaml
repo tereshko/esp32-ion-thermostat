@@ -1,0 +1,431 @@
+# ============================================================
+# DIY Thermostat - Home Assistant package (the HA half of this build)
+# ============================================================
+# Install: put this file into HA's packages folder and make
+# sure configuration.yaml contains:
+#   homeassistant:
+#     packages: !include_dir_named packages
+# then restart HA (or reload automations/scripts/helpers -
+# a full restart is the reliable first time).
+#
+# What this adds:
+#   1. Time-of-day profiles (Day / Evening / Night) written
+#      into the ESP's MANUAL 400A row at each period start.
+#      The wall must be in Touch-N-Go Manual for them to
+#      govern - the same wall contract.
+#   2. Hold semantics on top of the profiles:
+#        Schedule       - periods apply as they come.
+#        Temporary Hold - your manual pair stands until the
+#                         NEXT period start, then Schedule
+#                         resumes automatically (Honeywell
+#                         semantics). To use: pick this mode,
+#                         then set the pair on the device.
+#        Permanent Hold - your manual pair stands until you
+#                         change the mode yourself.
+#        Vacation       - the vacation pair applies now and
+#                         Schedule resumes automatically at
+#                         "Vacation Until".
+#   3. The ESP heartbeat for the dead-man return: the current
+#      epoch is written into the node's "HA Heartbeat" number
+#      every 5 minutes. If HA dies, the node notices on its
+#      own SNTP clock (thermostat.yaml).
+#   4. An alert if the node itself goes unavailable > 1 h.
+#   5. A filter reminder based on real equipment run hours
+#      (compressor running OR blower turning), counted from
+#      the last filter change.
+#
+# ENTITY IDS: the ESP device is "diy-thermostat", so its
+# entities are number.diy_thermostat_*.
+# Two telemetry entities below come from the hub's stock
+# spawns - if your HA shows different ids for "Compressor
+# Running" / blower RPM, fix them in the template sensor at
+# the bottom (marked CHECK).
+# ============================================================
+
+input_select:
+  hvac_hold_mode:
+    name: "HVAC Hold Mode"
+    icon: mdi:thermostat
+    options:
+      - Schedule
+      - Temporary Hold
+      - Permanent Hold
+      - Vacation
+    initial: Schedule
+
+input_datetime:
+  hvac_day_start:
+    name: "HVAC Day Starts"
+    has_date: false
+    has_time: true
+    initial: "10:00:00"
+  hvac_evening_start:
+    name: "HVAC Evening Starts"
+    has_date: false
+    has_time: true
+    initial: "17:30:00"
+  hvac_night_start:
+    name: "HVAC Night Starts"
+    has_date: false
+    has_time: true
+    initial: "00:00:00"
+  hvac_vacation_until:
+    name: "HVAC Vacation Until"
+    has_date: true
+    has_time: true
+  hvac_filter_changed_at:
+    name: "HVAC Filter Changed At"
+    has_date: true
+    has_time: true
+    initial: "2026-01-01 00:00:00"
+
+input_number:
+  hvac_day_heat:
+    name: "HVAC Day Heat"
+    min: 50
+    max: 85
+    step: 1
+    initial: 70
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  hvac_day_cool:
+    name: "HVAC Day Cool"
+    min: 60
+    max: 99
+    step: 1
+    initial: 74
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  hvac_evening_heat:
+    name: "HVAC Evening Heat"
+    min: 50
+    max: 85
+    step: 1
+    initial: 71
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  hvac_evening_cool:
+    name: "HVAC Evening Cool"
+    min: 60
+    max: 99
+    step: 1
+    initial: 75
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  hvac_night_heat:
+    name: "HVAC Night Heat"
+    min: 50
+    max: 85
+    step: 1
+    initial: 68
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  hvac_night_cool:
+    name: "HVAC Night Cool"
+    min: 60
+    max: 99
+    step: 1
+    initial: 76
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  hvac_vacation_heat:
+    name: "HVAC Vacation Heat"
+    min: 40
+    max: 85
+    step: 1
+    initial: 55
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  hvac_vacation_cool:
+    name: "HVAC Vacation Cool"
+    min: 60
+    max: 99
+    step: 1
+    initial: 85
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer
+  hvac_filter_hours_limit:
+    name: "HVAC Filter Hours Limit"
+    min: 100
+    max: 5000
+    step: 50
+    initial: 1000
+    unit_of_measurement: "h"
+    icon: mdi:air-filter
+
+input_boolean:
+  hvac_filter_reminder_sent:
+    name: "HVAC Filter Reminder Sent"
+    icon: mdi:bell-check
+
+input_button:
+  hvac_filter_changed:
+    name: "HVAC Filter Changed (press after replacing)"
+    icon: mdi:air-filter
+
+# --- "Equipment is running" for the filter hour counter.
+# CHECK: the two diy-thermostat entity ids - they are the
+# hub's stock telemetry spawns. If yours differ, fix here.
+template:
+  - binary_sensor:
+      - name: "Furnace Running"
+        unique_id: furnace_running
+        icon: mdi:hvac
+        state: >-
+          {{ is_state('binary_sensor.diy_thermostat_compressor_running', 'on')
+             or (states('sensor.diy_thermostat_blower_rpm') | float(0)) > 0 }}
+
+sensor:
+  - platform: history_stats
+    name: "Filter Runtime Hours"
+    unique_id: filter_runtime_hours
+    entity_id: binary_sensor.furnace_running
+    state: "on"
+    type: time
+    start: "{{ states('input_datetime.hvac_filter_changed_at') | as_datetime | as_local }}"
+    end: "{{ now() }}"
+
+script:
+  hvac_apply_period:
+    alias: "HVAC: apply a period pair to the manual row"
+    mode: single
+    sequence:
+      - choose:
+          - conditions: "{{ period == 'day' }}"
+            sequence:
+              - action: number.set_value
+                target:
+                  entity_id: number.diy_thermostat_manual_heat_setpoint
+                data:
+                  value: "{{ states('input_number.hvac_day_heat') }}"
+              - action: number.set_value
+                target:
+                  entity_id: number.diy_thermostat_manual_cool_setpoint
+                data:
+                  value: "{{ states('input_number.hvac_day_cool') }}"
+          - conditions: "{{ period == 'evening' }}"
+            sequence:
+              - action: number.set_value
+                target:
+                  entity_id: number.diy_thermostat_manual_heat_setpoint
+                data:
+                  value: "{{ states('input_number.hvac_evening_heat') }}"
+              - action: number.set_value
+                target:
+                  entity_id: number.diy_thermostat_manual_cool_setpoint
+                data:
+                  value: "{{ states('input_number.hvac_evening_cool') }}"
+          - conditions: "{{ period == 'night' }}"
+            sequence:
+              - action: number.set_value
+                target:
+                  entity_id: number.diy_thermostat_manual_heat_setpoint
+                data:
+                  value: "{{ states('input_number.hvac_night_heat') }}"
+              - action: number.set_value
+                target:
+                  entity_id: number.diy_thermostat_manual_cool_setpoint
+                data:
+                  value: "{{ states('input_number.hvac_night_cool') }}"
+          - conditions: "{{ period == 'vacation' }}"
+            sequence:
+              - action: number.set_value
+                target:
+                  entity_id: number.diy_thermostat_manual_heat_setpoint
+                data:
+                  value: "{{ states('input_number.hvac_vacation_heat') }}"
+              - action: number.set_value
+                target:
+                  entity_id: number.diy_thermostat_manual_cool_setpoint
+                data:
+                  value: "{{ states('input_number.hvac_vacation_cool') }}"
+
+  hvac_apply_current_period:
+    alias: "HVAC: apply whichever period is current now"
+    mode: single
+    sequence:
+      - variables:
+          period: >-
+            {% set t = now().strftime('%H:%M:%S') %}
+            {% set d = states('input_datetime.hvac_day_start') %}
+            {% set e = states('input_datetime.hvac_evening_start') %}
+            {% set n = states('input_datetime.hvac_night_start') %}
+            {% if t >= e %}evening{% elif t >= d %}day{% elif t >= n %}night{% else %}evening{% endif %}
+      - action: script.hvac_apply_period
+        data:
+          period: "{{ period }}"
+
+automation:
+  # Period boundaries: Schedule applies the new period;
+  # a Temporary Hold expires here (back to Schedule + apply);
+  # Permanent Hold and Vacation ignore boundaries.
+  - id: hvac_period_boundaries
+    alias: "HVAC: period boundaries"
+    mode: single
+    triggers:
+      - platform: time
+        id: day
+        at: input_datetime.hvac_day_start
+      - platform: time
+        id: evening
+        at: input_datetime.hvac_evening_start
+      - platform: time
+        id: night
+        at: input_datetime.hvac_night_start
+    actions:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_select.hvac_hold_mode
+                state: "Schedule"
+            sequence:
+              - action: script.hvac_apply_period
+                data:
+                  period: "{{ trigger.id }}"
+          - conditions:
+              - condition: state
+                entity_id: input_select.hvac_hold_mode
+                state: "Temporary Hold"
+            sequence:
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.hvac_hold_mode
+                data:
+                  option: "Schedule"
+              - action: script.hvac_apply_period
+                data:
+                  period: "{{ trigger.id }}"
+
+  # Mode changes: Vacation applies its pair immediately;
+  # returning to Schedule applies the current period at once.
+  - id: hvac_hold_mode_changed
+    alias: "HVAC: hold mode changed"
+    mode: single
+    triggers:
+      - platform: state
+        entity_id: input_select.hvac_hold_mode
+    actions:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_select.hvac_hold_mode
+                state: "Vacation"
+            sequence:
+              - action: script.hvac_apply_period
+                data:
+                  period: "vacation"
+          - conditions:
+              - condition: state
+                entity_id: input_select.hvac_hold_mode
+                state: "Schedule"
+            sequence:
+              - action: script.hvac_apply_current_period
+
+  # Vacation end: resume Schedule automatically.
+  - id: hvac_vacation_end
+    alias: "HVAC: vacation ends"
+    mode: single
+    triggers:
+      - platform: time
+        at: input_datetime.hvac_vacation_until
+    conditions:
+      - condition: state
+        entity_id: input_select.hvac_hold_mode
+        state: "Vacation"
+    actions:
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.hvac_hold_mode
+        data:
+          option: "Schedule"
+      # (the mode change above fires hvac_hold_mode_changed,
+      # which applies the current period)
+
+  # Heartbeat for the node's dead-man return (thermostat.yaml).
+  - id: hvac_ha_heartbeat
+    alias: "HVAC: ESP heartbeat"
+    mode: single
+    triggers:
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+    actions:
+      - action: number.set_value
+        target:
+          entity_id: number.diy_thermostat_ha_heartbeat
+        data:
+          value: "{{ as_timestamp(now()) | int }}"
+
+  # The node itself went silent for an hour.
+  - id: hvac_node_offline_alert
+    alias: "HVAC: node offline alert"
+    mode: single
+    triggers:
+      - platform: state
+        entity_id: number.diy_thermostat_manual_heat_setpoint
+        to: "unavailable"
+        for: "01:00:00"
+    actions:
+      - action: persistent_notification.create
+        data:
+          notification_id: hvac_node_offline
+          title: "DIY Thermostat node offline"
+          message: "The thermostat ESP has been unavailable for over an hour. The wall unit still runs the house on its own; HA-side profiles and steering are paused."
+
+  - id: hvac_node_back_alert_clear
+    alias: "HVAC: node back, clear alert"
+    mode: single
+    triggers:
+      - platform: state
+        entity_id: number.diy_thermostat_manual_heat_setpoint
+        from: "unavailable"
+    actions:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: hvac_node_offline
+
+  # Filter reminder from real run hours.
+  - id: hvac_filter_reminder
+    alias: "HVAC: filter reminder"
+    mode: single
+    triggers:
+      - platform: time_pattern
+        hours: "/1"
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ (states('sensor.filter_runtime_hours') | float(0))
+             >= (states('input_number.hvac_filter_hours_limit') | float(1000)) }}
+      - condition: state
+        entity_id: input_boolean.hvac_filter_reminder_sent
+        state: "off"
+    actions:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.hvac_filter_reminder_sent
+      - action: persistent_notification.create
+        data:
+          notification_id: hvac_filter_due
+          title: "Furnace filter due"
+          message: "Equipment run hours since the last filter change reached the limit. After replacing the filter, press 'HVAC Filter Changed'."
+
+  # Filter replaced: reset the counter and the latch.
+  - id: hvac_filter_changed
+    alias: "HVAC: filter changed"
+    mode: single
+    triggers:
+      - platform: state
+        entity_id: input_button.hvac_filter_changed
+    actions:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.hvac_filter_changed_at
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.hvac_filter_reminder_sent
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: hvac_filter_due

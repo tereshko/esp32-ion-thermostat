@@ -1,0 +1,1714 @@
+#pragma once
+
+#include "esphome/core/component.h"
+#include "esphome/core/automation.h"
+#include "esphome/core/preferences.h"
+#include "esphome/core/gpio.h"
+#include "esphome/components/uart/uart.h"
+#include "esphome/components/text_sensor/text_sensor.h"
+#ifdef USE_WIFI
+#include "esphome/components/wifi/wifi_component.h"
+#endif
+#ifdef USE_INFINITESP_STATUS_LIGHT
+#include "esphome/components/light/light_state.h"
+#include "esphome/components/light/light_traits.h"
+#endif
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <string>
+#include <map>
+#include <set>
+#include <vector>
+
+namespace esphome {
+namespace sensor {
+class Sensor;
+}  // namespace sensor
+namespace time {
+class RealTimeClock;
+}  // namespace time
+namespace binary_sensor {
+class BinarySensor;
+}  // namespace binary_sensor
+namespace infinitesp {
+
+// Temperature unit configuration for decoding bus register values. This is
+// a decode policy (AUTO = detect F/C from data), distinct from the entity-level
+// esphome::TemperatureUnit added in ESPHome 2026.8. Lives inside this
+// namespace so unqualified lookup can't find the esphome one.
+enum class TemperatureUnit : uint8_t {
+  AUTO = 0,  // heuristic: zone temp <= 50 → °C
+  FAHRENHEIT,
+  CELSIUS,
+};
+
+// Address constants
+// Thermostat install-discovery source address. Used by the thermostat itself
+// during initial system discovery on install. Documentary only — InfinitESP
+// never transmits as 0x1F. Kept distinct from FAKESAM to avoid conflating the
+// thermostat's discovery concept with our table-name probing.
+static const uint8_t ADDR_DISCOVERY = 0x1F;
+static const uint8_t ADDR_THERMOSTAT = 0x20;
+static const uint8_t ADDR_SAM = 0x92;
+static const uint8_t ADDR_FAKESAM = 0x93;
+static const uint8_t ADDR_ZONE_CTRL = 0x60;  // primary controller; 0x61 is secondary
+static const uint8_t ADDR_BROADCAST = 0xF1;
+
+// Device classes: the upper nibble of a bus address. The low nibble is the
+// instance, which varies by install (ODU is class 5: 0x50 on some systems,
+// 0x52 on others). Match with (addr >> 4) == CLASS_*; do not compare the full
+// address for class filtering.
+static const uint8_t CLASS_THERMOSTAT   = 0x2;  // UI / master
+static const uint8_t CLASS_INDOOR_UNIT  = 0x4;  // furnace / air handler
+static const uint8_t CLASS_OUTDOOR_UNIT = 0x5;  // condenser / heat pump / AC
+static const uint8_t CLASS_ZONE_CTRL    = 0x6;  // zone controller
+static const uint8_t CLASS_NIM         = 0x8;  // network interface module (HP dual-fuel / non-communicating bridge)
+
+// Function codes
+static const uint8_t FUNC_READ = 0x0B;
+static const uint8_t FUNC_REPLY = 0x06;
+static const uint8_t FUNC_WRITE = 0x0C;
+static const uint8_t FUNC_EXCEPTION = 0x15;
+
+// Register keys (table<<8 | row)
+static const uint16_t REG_DEVICE_INFO = 0x0104;
+static const uint16_t REG_SAM_STATUS = 0x030D;
+// Table 0x04 "SAM INTF" (interface). UID01-generation thermostats probe 040E during
+// INSTALL ("searching for remote access") and refuse to register a SAM that excepts
+// it (issue #41). Values below captured from the physical SAM; table 3F is refused
+// outright by real hardware (FUNC 0x15 code 0x04) — the store's unknown-register
+// exception already matches that answer.
+static const uint16_t REG_SAM_INTF_PN = 0x040E;    // interface software P/N (17 bytes)
+static const uint16_t REG_SAM_INTF_CFG = 0x0420;  // interface config (20 bytes)
+static const uint16_t REG_SAM_STATE = 0x3B02;
+static const uint16_t REG_SAM_ZONES = 0x3B03;
+// 0x3B04 = SAM vacation — pushed as a change-frame (see REG3B04_FLAG_*); never
+// seeded into the SAM's own register table. The THERMOSTAT, however, serves it
+// on READ: stored under 0x20 as REG_TSTAT_VACATION_STATE and polled by the SAM
+// slow rotation (live 2026-10-09, issue #33 probe).
+static const uint16_t REG_SAM_ACCESSORIES = 0x3B05;
+static const uint16_t REG_SAM_DEALER = 0x3B06;
+static const uint16_t REG_SAM_ACTIVITY = 0x3B0E;
+
+// Thermostat 0x4xxx registers (polled from thermostat at 0x20)
+// These are thermostat-internal configuration tables, not SAM registers.
+// Table 0x40 (SCHEDULE) is per-zone: row + zone-1 serves zone N. Rows 4002-4009 are
+// 70-byte weekly schedules, 400A-4011 the 35-byte comfort profiles. Verified live
+// 2026-08-19 against every zone's 3B03 setpoints (research/thermostat-table-40-perzone).
+static const uint16_t REG_TSTAT_SCHEDULE = 0x4002;      // Zone 1 weekly schedule: 7 days × 5 periods of (min/15, activity) (70 bytes)
+static const uint16_t REG_TSTAT_COMFORT = 0x400A;       // Zone 1 comfort profiles: 5 activities × 7 bytes (35 bytes)
+static const uint16_t REG_TSTAT_VACATION = 0x4012;      // Zone 1 vacation settings (7 bytes)
+
+// Thermostat-served vacation state (live 2026-10-09, issue #33): 3B04 answers
+// READ from the tstat in the change-frame layout — data[3]=Active (0/1),
+// data[4..5]=hours BE16 (the tstat's ADOPTED value; our SYSTXCCITC01 day-floors,
+// so
+// 36 h commanded serves 24 and sub-day serves 0), [6..10]=minT/maxT/minH/
+// maxH/fan (NOT consumed here; 4012 owns vacation temps and these bytes
+// reformat with °C mode). Fetched by the SAM slow poll; passive installs
+// never see it. See PROTOCOL "3B04 vacation change-frames and readback".
+static const uint16_t REG_TSTAT_VACATION_STATE = 0x3B04;
+// Thermostat zone temps at 1/16 °F (8 zones x 5 B: [flags u16][raw u16 /16 °F]
+// [smoothed u8], 0xA5 flag byte first — see PROTOCOL 3D02). Generation-split:
+// served by UIZ-line controls, refused by the ITC Touch line (first read
+// times out, a repeat read answers FUNC 0x15 code 04 → session drop), so
+// the slow-poll backoff removes it there. Fetched by the SAM slow
+// poll or passively observed when another master polls it.
+static const uint16_t REG_TSTAT_ZONETEMPS = 0x3D02;
+// Served-3B04 freshness window: ~4 missed slow-poll rotations (10-slot
+// rotation at 31 s/slot). Beyond it the preset detector falls back to the
+// setpoint-match heuristic and the number keeps its last value.
+static const uint32_t VACATION_SERVED_STALE_MS = 15UL * 60UL * 1000UL;
+// Outdoor Temperature repoint freshness window (issue #53): ODU temp tables
+// arrive at least every few seconds on tstat-polled installs and every ODU
+// slow-poll cycle (~31 s per register) in SAM mode, so 5 min only trips when
+// the ODU data is genuinely gone. It doubles as hysteresis against flapping
+// between sources (they track within ~0.3 °C: same sensor, different
+// sampling and rounding).
+static const uint32_t ODU_FINE_FRESHNESS_MS = 5UL * 60UL * 1000UL;
+// Thermostat 3D02 (zone temps at /16 °F) freshness window. Acquired via the
+// tstat slow-poll rotation, whose worst case (8 comfort rows + 7 fixed
+// registers) visits 3D02 every ~7.8 min; 10 min covers it with margin. The
+// lag is immaterial to data quality: indoor drift ~1 °F/h makes an 8-min-old
+// fine reading ~0.15 °F off, versus the ±0.5 °C 3B02 quantization it
+// replaces. Consumers also apply a 5 °C divergence guard against the fresh
+// 3B02 byte, which no legal indoor drift can trip.
+static const uint32_t TSTAT_3D02_FRESHNESS_MS = 10UL * 60UL * 1000UL;
+static const uint16_t REG_TSTAT_WIFI = 0x4608;          // SSID, password, hostname (~216 bytes)
+
+// Comfort-profile register for a zone (zone 1-8). 400A+zone-1.
+static inline uint16_t comfort_reg_for_zone(uint8_t zone) {
+  return REG_TSTAT_COMFORT + (zone - 1);
+}
+
+// ---- Thermostat fault log 0x4202 layout (verified live 2026-08-24, issue #22) ----
+// 72 bytes: 10 entries x 7 bytes (code, source, hour, minute, days_be16, status),
+// NEWEST FIRST, then a 2-byte trailer = install-relative day counter (NOT an
+// absolute epoch; Infinitude's fixed 2013-01-01 claim is disproven). Status low 7
+// bits = occurrence count. Bit 7: observed set at logging, cleared within ~2 min
+// on one banner-class fault, persisting on silent diagnostics; NOT liveness, NOT
+// acknowledgment, and unusable as a new-fault detector (it changes faster than
+// one slow-poll rotation). Semantics not characterized across installs — render
+// nothing based on it. No fault
+// liveness exists anywhere on the bus. Non-thermostat sources may pack fields
+// differently (observed hours 47/79) — entries with hour > 23, minute > 59, or
+// days > trailer are invalid for age math.
+static const uint8_t FAULT_ENTRY_COUNT = 10;
+static const uint8_t FAULT_ENTRY_SIZE = 7;
+static const uint8_t FAULT_REG_SIZE = 72;  // 10*7 + 2-byte day-counter trailer
+
+// Fault-log entry fields (offsets within one 7-byte entry).
+enum FaultEntry : uint8_t {
+  FAULT_CODE = 0,
+  FAULT_SOURCE = 1,
+  FAULT_HOUR = 2,
+  FAULT_MINUTE = 3,
+  FAULT_DAYS_HI = 4,
+  FAULT_DAYS_LO = 5,
+  FAULT_STATUS = 6,
+};
+
+// True if the entry's time/days fields are plausible (thermostat-sourced entries
+// are; some non-thermostat sources pack other data into these bytes).
+static inline bool fault_entry_time_valid(const std::vector<uint8_t> &data, uint8_t i) {
+  uint8_t base = i * FAULT_ENTRY_SIZE;
+  uint16_t days = ((uint16_t) data[base + FAULT_DAYS_HI] << 8) | data[base + FAULT_DAYS_LO];
+  uint16_t trailer = ((uint16_t) data[70] << 8) | data[71];
+  return data[base + FAULT_HOUR] <= 23 && data[base + FAULT_MINUTE] <= 59 && days <= trailer;
+}
+
+// Entry age in minutes, from the entry's own fields plus the register's day
+// trailer and a "now" bus-clock minute count (SAM 3B02 REG3B02_MINUTES). The
+// (trailer - days) term carries midnight rollover. Caller must have validated
+// the entry (fault_entry_time_valid) and that data->size() >= FAULT_REG_SIZE.
+static inline int32_t fault_entry_age_minutes(const std::vector<uint8_t> &data, uint8_t i,
+                                               uint16_t now_bus_min) {
+  uint8_t base = i * FAULT_ENTRY_SIZE;
+  uint16_t days = ((uint16_t) data[base + FAULT_DAYS_HI] << 8) | data[base + FAULT_DAYS_LO];
+  uint16_t trailer = ((uint16_t) data[70] << 8) | data[71];
+  uint16_t entry_min = data[base + FAULT_HOUR] * 60 + data[base + FAULT_MINUTE];
+  return (int32_t) (trailer - days) * 1440 + (int32_t) now_bus_min - (int32_t) entry_min;
+}
+static const uint16_t REG_TSTAT_CLOUD = 0x4609;         // Cloud host, proxy server IP
+static const uint16_t REG_TSTAT_DEALER = 0x460A;        // Dealer name, brand, URL (120 bytes)
+static const uint16_t REG_TSTAT_FAULTS = 0x4202;        // Fault history (10 entries × 7 bytes = 70 bytes)
+static const uint16_t REG_TSTAT_WIFI_PROFILES = 0x460B; // WiFi profiles (4x 36 bytes)
+static const uint16_t REG_TSTAT_WIFI_SCAN = 0x460C;     // WiFi scan results (4x 36 bytes)
+
+// Comfort profile layout (registers 400A-4011, 35 bytes each; one per zone)
+// 5 activities × 7 bytes: [heat_sp(1), cool_sp(1), fan_mode(1), rclg_rhtg(1), hum_vent(1), unk5(1), unk6(1)]
+//   byte[3] = (rhtg << 4) | rclg — reheat heating/cooling dehumidify setpoint indices (nibbles)
+//   byte[4] = humidifier/ventilation mode flags (bitfield, exact mapping TBD)
+//   byte[5-6] = purpose unclear (always 0x1E on this system)
+// Order: home, away, sleep, wake, manual
+static const uint8_t COMFORT_ACTIVITY_COUNT = 5;
+static const uint8_t COMFORT_ENTRY_SIZE = 7;
+static const uint8_t COMFORT_HOME = 0;
+static const uint8_t COMFORT_AWAY = 1;
+static const uint8_t COMFORT_SLEEP = 2;
+static const uint8_t COMFORT_WAKE = 3;
+static const uint8_t COMFORT_MANUAL = 4;
+
+// Number entity flavors (see number/__init__.py and infinitesp_number.h).
+enum NumberType : uint8_t {
+  NUMBER_HOLD_MINUTES = 0,
+  NUMBER_VACATION_HOURS = 1,
+};
+
+// Change flags for 3B03 writes
+static const uint8_t CHANGE_FAN = 0x01;
+static const uint8_t CHANGE_HOLD = 0x02;
+static const uint8_t CHANGE_HEAT = 0x04;
+static const uint8_t CHANGE_COOL = 0x08;
+static const uint8_t CHANGE_MODE = 0x10;
+static const uint8_t CHANGE_OVERRIDE = 0x80;
+
+// System modes (stagmode low nibble; heat sources per infinitive's decode,
+// live-verified 2026-09-09/10). 0 = heat with the configured source (furnace
+// on gas gear), 3 = electric-only (fan-coil aux), 4 = heat-pump-only
+// (dual-fuel). Writing 3/4 on gear lacking the source: the thermostat ACKs
+// and normalizes to system heat. 5 = off and fanonly (shared; the blower
+// command IDU 0305 distinguishes them). Nibble 4 is never served on reads by
+// our AC-only rig; read paths render it as heat_pump.
+static const uint8_t SYSMODE_HEAT = 0;
+static const uint8_t SYSMODE_COOL = 1;
+static const uint8_t SYSMODE_AUTO = 2;
+static const uint8_t SYSMODE_EHEAT = 3;
+static const uint8_t SYSMODE_HEATPUMP = 4;
+static const uint8_t SYSMODE_OFF = 5;
+// Shared name table, index-aligned with the SYSMODE_* constants above.
+// Used by the select and the mode-write adoption WARN in loop(); keep in
+// sync with the nibble semantics in PROTOCOL (stagmode section).
+static const char *const SYSMODE_NAMES[] = {"heat", "cool", "auto", "emergency_heat", "heat_pump", "off"};
+
+// Fan modes
+static const uint8_t FAN_AUTO = 0;
+static const uint8_t FAN_LOW = 1;
+static const uint8_t FAN_MED = 2;
+static const uint8_t FAN_HIGH = 3;
+
+// Zone Controller registers (device address 0x60)
+static const uint16_t REG_ZC_ZONE_STATUS = 0x0302;  // Zone sensor readings (24-byte TLV, see layout below)
+static const uint16_t REG_ZC_DAMPER_CMD = 0x0308;   // Damper positions (write from tstat)
+static const uint16_t REG_ZC_ZONE_CONFIG = 0x0319;  // Damper state feedback (8 bytes)
+static const uint16_t REG_ZC_PRESENCE = 0x3405;      // Presence probe (discovery)
+static const uint16_t REG_ZC_HEARTBEAT = 0x3404;     // Write/heartbeat flag (1 byte)
+static const uint16_t REG_ZC_CYCLES = 0x0310;       // Cycle counters (12 bytes, 3 KV entries)
+static const uint16_t REG_ZC_RUNTIME = 0x0311;      // Runtime hours (12 bytes, 3 KV entries)
+
+// ZC register 0302 (REG_ZC_ZONE_STATUS) — 24-byte TLV: six entries of
+// [tag, id, val_hi, val_lo], always sent in id order:
+//   0x01 z1, 0x02 z2, 0x03 z3, 0x04 z4, 0x14 LAT, 0x1C HPT.
+// tag 0x01 = sensor present (value valid); 0x04 = not installed (0x0000).
+// Value = uint16 BE, °F = value / 16. e.g. 0x047E → 1150 → 71.875°F.
+// Verified by hooking a thermistor to the LAT/HPT ports and reading the
+// thermostat's Furnace Status page (not (°F-64)×16 as once guessed).
+static const uint8_t ZC_0302_TAG_PRESENT = 0x01;
+static const uint8_t ZC_ID_LAT = 0x14;              // LAT — leaving air temperature thermistor
+static const uint8_t ZC_ID_HPT = 0x1C;              // HPT thermistor port
+static const float ZC_TEMP_SCALE = 16.0f;
+// Sanity band for thermistor feeds (LAT/HPT). Supply air can exceed the
+// 40-99°F indoor band used for zones; -40..250°F covers any real HVAC
+// thermistor while still catching gross sensor_unit misconfigurations.
+static const float ZC_THERMISTOR_MIN_F = -40.0f;
+static const float ZC_THERMISTOR_MAX_F = 250.0f;
+
+// NIM registers (device address 0x80, class 8). Proven live over a full
+// call/defrost cycle — issue #41 16 h capture; layouts in PROTOCOL.md
+// "NIM (0x80)". The NIM bridges ONE non-communicating device (1-/2-stage HP
+// dual fuel, 2-speed R-22 ODU, or an HRV/ERV, plus optionally one ventilator
+// on YRGB) onto the ABCD bus. It never initiates traffic and never ACKs
+// writes (0 register-matched replies to 11,207 writes in the capture);
+// the tstat re-sends 0305/3404 as standing commands every ~10 s cycle.
+static const uint16_t REG_NIM_DESCRIPTOR = 0x0302;  // 4 B `04 11 00 00` (IDU-class generic prefix; Touch-gen polls it standing, ~13 s)
+static const uint16_t REG_NIM_DEMAND = 0x0305;      // tstat write, 12 B: [0] heat stage, [2] cool stage
+static const uint16_t REG_NIM_CMD = 0x030B;         // 4 B one-off write (00 AA 00 00 seen once)
+static const uint16_t REG_NIM_DIAG = 0x030D;        // 7 B zeros (never seen nonzero)
+static const uint16_t REG_NIM_CFG_STATUS = 0x030E;  // 8 B. UID01 reads it only around config changes. Touch-gen polls it standing (~31 s)
+static const uint16_t REG_NIM_CYCLES = 0x0310;      // 32 B counters, constant across a 3.85 h idle window
+static const uint16_t REG_NIM_RUNTIME = 0x0311;     // 32 B counters; BE16 at [30..31] is powered hours, ticks hourly
+static const uint16_t REG_NIM_STATUS = 0x0316;      // 15 B reply: mirrors demand, defrost input
+static const uint16_t REG_NIM_CONFIG = 0x031C;      // 28 B config push; real NIM NEVER answers reads of it
+// Table-34 handshake registers are shared with the ZC (REG_ZC_HEARTBEAT /
+// REG_ZC_PRESENCE): the tstat's INSTALL scan probes ZC slots and the NIM slot
+// with the same 3405 presence read.
+
+// NIM 0316 layout (offsets header-relative). 15 B with the constant 01 at
+// [10] holds across all three captures and both tstat generations (UID01
+// #41: 5601/5601 replies; WIC01 #55: 1232/1232; 2026-09-28 capture: 26/26).
+static const uint8_t NIM_STATUS_SIZE = 15;
+static const uint8_t NIM_STATUS_HEAT = 0;     // heat stage — mirrors 0305 [0]
+static const uint8_t NIM_STATUS_COOL = 2;     // cool stage — mirrors 0305 [2] (demand, not actuals)
+static const uint8_t NIM_STATUS_CONST = 10;   // 0x01 always, idle included
+static const uint8_t NIM_STATUS_DEFROST = 14; // defrost flag — physical input from the HP defrost board
+
+// Register 3B02 layout offsets (see AGENTS.md for full layout)
+static const uint8_t REG3B02_ACTIVE_ZONES = 0;
+static const uint8_t REG3B02_TEMPS = 3;             // zone temperatures[8], °F
+static const uint8_t REG3B02_HUMIDITY = 11;          // zone humidity[8], %
+static const uint8_t REG3B02_OUTDOOR_TEMP = 20;      // outdoor air temp °F
+static const uint8_t REG3B02_UNOCCUPIED = 21;        // zones_unoccupied bitmask
+static const uint8_t REG3B02_STAGMODE = 22;          // high nibble=stage, low nibble=mode
+static const uint8_t REG3B02_WEEKDAY = 25;
+static const uint8_t REG3B02_MINUTES = 26;           // uint16 BE, minutes since midnight
+static const uint8_t REG3B02_DISPLAYED_ZONE = 28;
+static const uint8_t REG3B02_SIZE = 29;
+
+// 3B02 change-flag word (BE16 at register offsets 1-2): which fields the
+// thermostat adopts from a write
+static const uint16_t CHANGE_WEEKDAY = 0x080;
+static const uint16_t CHANGE_MINUTES = 0x100;
+static const uint16_t CHANGE_DISPLAYED_ZONE = 0x200;
+
+// Register 3B03 layout offsets (see AGENTS.md for full layout)
+static const uint8_t REG3B03_ACTIVE_ZONES = 0;
+static const uint8_t REG3B03_CHANGE_FLAGS = 2;
+static const uint8_t REG3B03_FAN_MODES = 3;           // fan_mode[8]
+static const uint8_t REG3B03_ZONES_HOLDING = 11;      // bitmask
+static const uint8_t REG3B03_HEAT_SETPOINTS = 12;     // heat_sp[8], °F
+static const uint8_t REG3B03_COOL_SETPOINTS = 20;     // cool_sp[8], °F
+static const uint8_t REG3B03_HUMIDITY_SETPOINTS = 28;  // humidity_sp[8], %
+static const uint8_t REG3B03_SPEED_FAN = 36;         // speed_controlled_fan (Infinitude's label, unverified by us)
+static const uint8_t REG3B03_TIMED_HOLDS = 37;       // bitmask, bit N = zone N+1 countdown running (verified 2026-08-27)
+static const uint8_t REG3B03_HOLD_DURATIONS = 38;     // hold_duration[8], uint16 BE each
+static const uint8_t REG3B03_ZONE_NAMES = 54;         // zone_names[8], 12 chars each
+static const uint8_t REG3B03_SIZE = 150;
+
+// SAM register 0x3B04 — vacation push frame (11 data bytes).
+// DECIPHERED 2026-07-09 from a real SAM bridged to the live bus, then verified
+// from InfinitESP: this is NOT a flat config register. It is a change-
+// notification frame the SAM WRITES to the thermostat. data[2] is a bitmask of
+// which fields this frame updates; the field value sits at a fixed byte (only
+// flagged bytes are applied, the rest are 0xFF). The thermostat NEVER reads 3B04
+// from the SAM (confirmed by snoop), so InfinitESP stores vacation config in
+// dedicated members (vacation_*) and pushes one change-frame per setter.
+//   data[2] bit 0x02 -> hours remaining, uint16 BE at data[4..5]  (verified)
+//   data[2] bit 0x04 -> min_temp °F/C at data[6]                   (verified)
+//   data[2] bit 0x08 -> max_temp °F/C at data[7]                   (verified)
+//   data[2] bit 0x10 -> min_humidity at data[8]   (pattern-implied; AC-only sys can't observe)
+//   data[2] bit 0x20 -> max_humidity at data[9]   (pattern-implied; AC-only sys can't observe)
+//   data[2] bit 0x40 -> fan mode 0..3 at data[10]                  (verified)
+static const uint8_t REG3B04_DATA_BYTES = 11;
+static const uint8_t REG3B04_FLAG_HOURS = 0x02;       // data[4..5] = hours BE
+static const uint8_t REG3B04_FLAG_MIN_TEMP = 0x04;    // data[6]
+static const uint8_t REG3B04_FLAG_MAX_TEMP = 0x08;    // data[7]
+static const uint8_t REG3B04_FLAG_MIN_HUM = 0x10;     // data[8]
+static const uint8_t REG3B04_FLAG_MAX_HUM = 0x20;     // data[9]
+static const uint8_t REG3B04_FLAG_FAN = 0x40;         // data[10]
+
+// Register 3B05 (REG_SAM_ACCESSORIES) layout — accessory life & reminders (11 bytes)
+// NOTE on provenance: ordering validated 2026-10-24 against a live capture
+// from lurgh's install (real SAM polls his tstat every ~6 s; frame
+// 03 00 00 1E 00 00 01 00 00 00 00 = filter 30% used + filter reminder ON,
+// the two fields he vouches for), which discriminated between this layout
+// (blhoward2's, #54) and the older Infinitude-inherited ordering (ventilator
+// at 6, reminders at 7-10 — decodes his frame as "ventilator 1%" on a system
+// with no ventilator). Unused accessories read 0x00 on his tstat; 0xFF means
+// not configured (physical-SAM probe 2026-06, all accessory bytes FF).
+// Values are consumption % (0 = new/reset, 100 = replace); the ASCII
+// `FILTRLVL!0` reset presumably maps to writing 0 here. byte 1 is the
+// shared metric_units flag (live-tested). [0] and [2] are undecoded flags
+// (seen: 0x00/0x03 at [0], 0x00/0x80 at [2]).
+static const uint8_t REG3B05_FILTER = 3;          // filter life used %
+static const uint8_t REG3B05_UV = 4;              // UV lamp life used %
+static const uint8_t REG3B05_HUMIDIFIER = 5;      // humidifier pad life used %
+static const uint8_t REG3B05_FILTER_RMD = 6;      // 0=off, 1=on
+static const uint8_t REG3B05_UV_RMD = 7;
+static const uint8_t REG3B05_HUMIDIFIER_RMD = 8;
+static const uint8_t REG3B05_VENTILATOR = 9;      // ventilator filter life used %
+static const uint8_t REG3B05_VENTILATOR_RMD = 10;
+static const uint8_t REG3B05_SIZE = 11;
+
+// Register 3B06 (REG_SAM_DEALER) layout — dealer info & config (52 bytes)
+// NOTE on provenance: inherited from Infinitude's CarBus::SAM 3B06 parser (our
+// own RE, not a Carrier source) after its 2026-06-26 restructure. The metric_units
+// flag at byte 1 (mirror at byte 10) has live-test backing; the rest (deadband,
+// cycles_per_hour, schedule_periods, programs_enabled, dealer_name/phone offsets)
+// is unconfirmed vs. real hardware. byte 7 was previously guessed 'temp_units'
+// but is observed 0xFF on Touch (the F/C ASCII codes live only on the RS-232 port,
+// not in this register); the prior 'auto_mode' guess at byte 1 is incompatible
+// with the unit flag, so CFGAUTO has no confirmed field and is not exposed.
+static const uint8_t REG3B06_BACKLIGHT = 0;         // Touch: ON=level>=3, OFF=<=2
+static const uint8_t REG3B06_METRIC_UNITS = 1;      // 0=English, 1=Metric (shared flag)
+static const uint8_t REG3B06_DEADBAND = 3;          // 0-6
+static const uint8_t REG3B06_CYCLES_PER_HOUR = 4;   // 2-6
+static const uint8_t REG3B06_SCHEDULE_PERIODS = 5;  // 2 or 4
+static const uint8_t REG3B06_PROGRAMS_ENABLED = 6;  // 0=off, 1=on
+static const uint8_t REG3B06_DEALER_NAME = 12;      // 20 bytes (18 usable)
+static const uint8_t REG3B06_DEALER_PHONE = 32;     // 20 bytes (18 usable)
+static const uint8_t REG3B06_SIZE = 52;
+
+// IDU (Indoor Unit / Furnace / Air Handler) register keys
+// These are passively snooped from thermostat↔IDU traffic.
+// IDU (Indoor Unit) register keys
+// Passively snooped from thermostat<->IDU traffic.
+// IDU tables (from device self-described 0xXX01 tabledefs):
+//   0x01 DEVCONFG  device configuration (REG_DEVICE_INFO = 0x0104)
+//   0x02 SYSTIME  system time/date (thermostat-owned)
+//   0x03 RLCSMAIN main controller, RLCS (Residential & Light Commercial Systems) family - IDU-side (498 bytes, 30 rows)
+//   0x04 VARSPEED variable-speed ECM blower drive (300 bytes, 17 rows)
+// Tables 0x05-0x0F return FUNC 0x15 (not present on this hardware).
+//
+// Table 0x03 RLCSMAIN:
+static const uint16_t REG_IDU_STATUS = 0x0306;     // Blower RPM, operating info (10 bytes)
+static const uint16_t REG_IDU_CONFIG = 0x0316;      // Heat stage [0], airflow CFM [4..5], static pressure [7..8] (14 bytes)
+static const uint16_t REG_IDU_AIRFLOW_CMD = 0x0305; // tstat->IDU blower CFM command, BE16 [4..5], write-only
+static const uint16_t REG_IDU_CYCLES = 0x0310;     // Cycle counters (4-byte key-value entries)
+static const uint16_t REG_IDU_RUNTIME = 0x0311;    // Runtime hours (4-byte key-value entries)
+
+// ODU (Outdoor Unit) register keys
+// Passively snooped from thermostat<->ODU traffic.
+// ODU tables (from device self-described 0xXX01 tabledefs):
+//   0x01 DEVCONFG  device configuration (REG_DEVICE_INFO = 0x0104)
+//   0x02 SYSTIME  system time/date (thermostat-owned; ODU never reads it)
+//   0x03 RLCSMAIN main controller, RLCS (Residential & Light Commercial Systems) family - ODU sensors & loop state
+//   0x06 VAR COMP variable-speed compressor drive - stage, EXV, requested CFM
+// Tables 0x04,0x05,0x07-0x0F return FUNC 0x15 (not present on this hardware).
+//
+// Table 0x03 RLCSMAIN:
+static const uint16_t REG_ODU_STATUS1 = 0x0302;    // Typed TLV: entries [u16 type, u16 value], value = raw/16 (F temps, PSI pressures)
+static const uint16_t REG_ODU_STATUS2 = 0x0303;    // Typed TLV (same entry scheme): pressures (0x130 suction, 0x152 discharge on some families)
+static const uint16_t REG_ODU_STATUS3 = 0x0304;    // Temperatures and pressures
+// ODU 0302/0303 entry-type codes (typed-TLV scheme; decode helpers are class
+// members). The type identifies the CHANNEL; the quantity follows the
+// register row: 0302 serves temperatures (F), 0303 serves pressures (PSI).
+// Provenance: dragonflight disc #232 2026-09-08; screen-confirmed on a
+// 24VNA948A 2026-09-09 (suction temp 58 F = 0302/0x130, suction pressure
+// 135 PSI = 0303/0x130, discharge temp 119 F = 0302/0x145, superheat 12.0 =
+// 0302/0x14A).
+static const uint16_t ODU_TLV_OAT = 0x0111;   // outdoor air temp
+static const uint16_t ODU_TLV_OCT = 0x0112;   // outdoor coil temp
+static const uint16_t ODU_TLV_OST = 0x0113;   // outdoor ?temp
+static const uint16_t ODU_TLV_LAT = 0x0114;   // leaving air temp
+static const uint16_t ODU_TLV_HPT = 0x011C;   // heat pump ?temp
+static const uint16_t ODU_TLV_OSP = 0x0130;   // suction channel: line temp in 0302 (F), pressure in 0303 (PSI)
+static const uint16_t ODU_TLV_DIS = 0x0140;   // discharge temp (HP families)
+static const uint16_t ODU_TLV_SSH = 0x014A;   // suction superheat (dF)
+static const uint16_t ODU_TLV_14B = 0x014B;   // unnamed (liquid line at a guess)
+static const uint16_t ODU_TLV_DIS2 = 0x0145;  // discharge temp (screen-confirmed, both AC families)
+static const uint16_t ODU_TLV_DSP = 0x0152;   // discharge pressure (PSI; 26VNA148 family, 0303)
+static const uint16_t ODU_TLV_SUCT = 0x0154;  // suction line temp (26VNA148 family, 0302)
+static const uint16_t REG_ODU_CYCLES = 0x0310;     // Cycle counters (4-byte key-value entries)
+static const uint16_t REG_ODU_RUNTIME = 0x0311;    // Runtime hours (4-byte key-value entries)
+//
+// Table 0x06 VAR COMP:
+static const uint16_t REG_ODU_COMP_SPEED = 0x0604;  // Compressor speed: target RPM [0..1], current RPM [2..3] (per stage)
+static const uint16_t REG_ODU_DEMAND = 0x0608;     // Compressor drive: requested IDU airflow uint16 at [5..6] (CFM), expansion valve % at [2]
+static const uint16_t REG_ODU_CMD_STAGE = 0x0605;  // Commanded compressor stage (float32 at [0..3]: 0.0/1.0..5.0)
+static const uint16_t REG_ODU_STAGE_INFO = 0x060E;  // Actual stage index (byte 0: 0=off, 1..5=stage)
+static const uint16_t REG_ODU_SETPOINT = 0x060B;   // Target value at byte[2], native °F (label TBD; not confirmed a cooling setpoint)
+static const uint16_t REG_ODU_FLOATS = 0x061F;     // IEEE754 float32 array (superheat, subcooling, etc.)
+//
+// Table 0x3E — 2-stage / two-capacity ODU family (24ANA1, 24ANB7, 25HNB5...).
+// Variable-speed units answer reads in this table with FUNC 0x15 (probed live
+// on a 24VNA9: 3E01/3E02/3E08 all refused, payload=04), so decoders keyed here
+// are inert on them. The two families are disjoint; no discriminator is needed.
+// Issue #21 (24ANA160A), panel-validated 2026-08-14.
+static const uint16_t REG_ODU_3E_TEMPS = 0x3E01;   // int16 BE /16 °F slots: 0=outdoor, 1=coil, 2-3=sensors-if-fitted
+static const uint16_t REG_ODU_3E_STAGE = 0x3E02;   // Stage byte (see odu_3e_stage_)
+static const uint16_t REG_ODU_3E_MODEL = 0x3E08;   // Model string, 16 chars
+static const uint16_t REG_ODU_3E_SERIAL = 0x3E09;  // Serial string, 16 chars (Carrier WWYY prefix)
+
+// Frame constants
+static const uint8_t FRAME_HEADER_SIZE = 8;
+static const uint8_t FRAME_CRC_SIZE = 2;
+static const uint16_t FRAME_MIN_SIZE = 10;
+static const uint16_t FRAME_MAX_SIZE = 266;
+
+struct InfinitESPFrame {
+  uint8_t dst;
+  uint8_t dst_bus;
+  uint8_t src;
+  uint8_t src_bus;
+  uint8_t length;
+  uint8_t pid;
+  uint8_t ext;
+  uint8_t func;
+  std::vector<uint8_t> payload;
+  uint16_t checksum;
+};
+
+// Extract a null-terminated C string from a byte vector at the given offset
+static inline std::string extract_cstr(const std::vector<uint8_t> &data, size_t offset) {
+  if (offset >= data.size())
+    return "";
+  size_t end = offset;
+  while (end < data.size() && data[end] != 0)
+    end++;
+  return std::string(data.begin() + offset, data.begin() + end);
+}
+
+// Per-zone configuration for external temperature sensor references
+struct ZCZoneConfig {
+  sensor::Sensor *temp_sensor{nullptr};
+  uint8_t sensor_unit{0};  // 0=inherit from bus, 1=°C, 2=°F
+  uint32_t staleness_timeout_ms{120000};  // 2 minutes default
+  uint32_t last_sensor_update_ms{0};
+  float last_sensor_value{NAN};
+};
+
+class InfinitESPComponent;
+
+// Sink for the optional bus_jsonl stream component: receives every
+// dispatched RX frame (post-validate) and every TX frame at transmit time.
+// Abstract so the hub carries no dependency on the streaming component —
+// external-component staging only pulls what a user's yaml references.
+// The hub redacts before the call: credential/dealer registers are never
+// offered, and serial-bearing registers arrive with serial suffixes masked
+// ('*' bytes; the WWYY manufacture prefix survives).
+class BusFrameSink {
+ public:
+  virtual ~BusFrameSink() = default;
+  virtual void offer_frame(uint32_t ms, uint8_t src, uint8_t dst, uint8_t func,
+                           uint16_t reg, const uint8_t *data, size_t len) = 0;
+  // Contract: data != nullptr renders a data string ("" when the frame has
+  // no data section, i.e. reads); data == nullptr renders null, reserved
+  // for anomalous omissions.
+};
+
+class InfinitESPEntity {
+ public:
+  virtual void on_register_update(uint8_t device_addr, uint16_t register_key) = 0;
+  // A slow-poll target was dropped for the session (issue #41): it will not
+  // be read again before reboot. Default no-op. Sensors that can render a
+  // no-data state (fault_timestamp -> NAN) override it; text sensors have
+  // none and rely on the REPORT "dropped" list.
+  virtual void on_register_dropped(uint8_t device_addr, uint16_t register_key) {}
+  // System mode is global (one ODU, one stagmode). Called when ANY source
+  // commands a mode change (HA climate control() or ASCII MODE!) so every
+  // entity reflects it in lockstep without waiting for the lagging bus confirm.
+  // Default no-op; climate entities override to update their HA mode.
+  virtual void on_system_mode_commanded(uint8_t sys) {}
+  void set_parent(InfinitESPComponent *parent) { parent_ = parent; }
+  void set_zone(uint8_t zone) { zone_ = zone; }
+  uint8_t get_zone() const { return zone_; }
+  void set_bus_class(uint8_t cls) { bus_class_ = cls; }
+  uint8_t get_bus_class() const { return bus_class_; }
+  // Exact bus-node pin. 0 = none (class matching via bus_class_). A pin takes
+  // precedence over the class gate in notify_entities_(), which is how the
+  // hub-level idu_address/odu_address overrides reach installs whose unit
+  // sits off the assumed class (e.g. a 0x3E furnace, disc #232).
+  void set_device_address(uint8_t addr) { device_address_ = addr; }
+  uint8_t get_device_address() const { return device_address_; }
+
+ protected:
+  InfinitESPComponent *parent_{nullptr};
+  uint8_t zone_{0};
+  uint8_t bus_class_{0};  // upper nibble of bus address: 0=any, 2=tstat, 4=IDU, 5=ODU, 9=SAM
+  uint8_t device_address_{0};  // exact node pin, 0 = none (class matching)
+};
+
+class InfinitESPComponent : public Component, public uart::UARTDevice {
+ public:
+  InfinitESPComponent() = default;
+
+  void setup() override;
+  void loop() override;
+
+  // True when the thermostat's blower CFM command (IDU 0305) is nonzero.
+  // Distinguishes fan-only (nonzero) from off (0) while both share mode
+  // nibble 5. Returns false when 0305 has not been captured yet.
+  bool idu_blower_commanded_() const;
+  // Class-scoped register store lookup for IDU registers, tolerant of the
+  // commissioned address varying across installs (0x40 here, 0x3E on some).
+  const std::vector<uint8_t> *get_idu_register(uint16_t key) const;
+
+  // Equipment-evidence direction for climate action (#51): 1 = heating,
+  // 2 = cooling, -1 = no positive evidence. IDU 0316 heat stage first,
+  // cooling flag second. Compressor-running elimination is deliberately
+  // NOT implemented: it needs an HP-vs-AC system identity the bus does not
+  // carry (0602 has no direction bit — C1 and 0x81 both appear in one
+  // HP-heat window; idle values vary by family: 0xC0 on 0x57, 0xD0 on
+  // 24VNA9 — checked 2026-10-24).
+  int8_t equipment_direction_() const {
+    const auto *idu = get_idu_register(REG_IDU_CONFIG);
+    if (idu && !idu->empty()) {
+      if (idu_electric_heat_(*idu))
+        return 1;
+      if (idu_cooling_(*idu))
+        return 2;
+    }
+    return -1;
+  }
+  // Same for ODU registers (class 5; first matching node wins - installs
+  // with a second class-5 node like the 0x5F refrig board return whichever
+  // serves the key, which in practice is the commissioned ODU).
+  const std::vector<uint8_t> *get_odu_register(uint16_t key) const;
+
+  // Timed-hold setter debounce, owned by the hub (the setter entities are
+  // plain entities, NOT Components: auto-spawned Component registrations
+  // corrupt the loop-slot scheduling and stall this loop entirely — the
+  // 2026-08-28 outage). Each zone has one pending slot; a new set replaces it.
+  void queue_hold_set(uint8_t zone, uint16_t minutes, uint32_t debounce_ms, const char *source);
+  float get_setup_priority() const override { return setup_priority::DATA; }
+
+  void set_sam_address(uint8_t addr) { sam_address_ = addr; }
+  uint8_t get_sam_address() const { return sam_address_; }
+  bool sam_enabled() const { return sam_address_ != 0; }
+  // ESPHome time source backing the sam_ascii TIME!NOW verb (clock phase 2,
+  // issue #45). Null when no time: platform is configured and no time_id:
+  // resolves - TIME!NOW then refuses (plain NAK + log) rather than write an
+  // unvalidated clock. Never drives periodic writes: auto-sync is banned by
+  // human directive (Q11); this source is read only on explicit command.
+  void set_time_source(time::RealTimeClock *clock) { time_source_ = clock; }
+  time::RealTimeClock *get_time_source() const { return time_source_; }
+  // Attach the bus_jsonl stream (see BusFrameSink above). Single sink; a
+  // second bus_jsonl block in yaml would silently replace the first.
+  void set_bus_jsonl(BusFrameSink *sink) { frame_sink_ = sink; }
+  void set_zc_address(uint8_t addr) { zc_address_ = addr; }
+  uint8_t get_zc_address() const { return zc_address_; }
+  bool zc_enabled() const { return zc_address_ != 0; }
+
+  // Hub-pinned unit addresses: 0 (default) keeps class-nibble matching;
+  // a nonzero value pins all IDU/ODU-scoped entities to that exact node.
+  // Needed because the class nibble is not a device-type key across installs
+  // (our furnace 0x40, disc #232's furnace 0x3E; brybus 0x30 serves 3B0x).
+  // Also keeps a second class-5 node (their 0x5F refrig board) out of ODU
+  // entity dispatch and the ODU slow-poll rotation.
+  void set_idu_address(uint8_t addr) { idu_address_ = addr; }
+  uint8_t get_idu_address() const { return idu_address_; }
+  void set_odu_address(uint8_t addr) { odu_address_ = addr; }
+  uint8_t get_odu_address() const { return odu_address_; }
+
+  // Opt-in for the emergency_heat/heat_pump mode writes (nibbles 3/4). Off by
+  // default; set_system_mode() refuses those modes unless enabled.
+  void set_experimental_heat_source_modes(bool enable) { experimental_heat_source_modes_ = enable; }
+  bool heat_source_modes_enabled() const { return experimental_heat_source_modes_; }
+
+  // Device-role matchers: exact node when pinned, else the class nibble.
+  bool is_idu_addr_(uint8_t addr) const {
+    return idu_address_ != 0 ? addr == idu_address_ : (addr >> 4) == CLASS_INDOOR_UNIT;
+  }
+  bool is_odu_addr_(uint8_t addr) const {
+    return odu_address_ != 0 ? addr == odu_address_ : (addr >> 4) == CLASS_OUTDOOR_UNIT;
+  }
+
+  // Multi-ZC mapping. A Carrier damper system uses one SYSTXCC4ZC01 per four
+  // zones: the primary controller (base = zc_address_ when emulating, else
+  // ADDR_ZONE_CTRL/0x60) serves system zones 1-4, and a second controller at
+  // base+1 serves zones 5-8. Verified on hardware: two physical controllers
+  // answer the thermostat at 0x60 and 0x61 (issue #9). Each controller numbers
+  // its own four zones 1-4 (local id), so system zone N maps to a (controller,
+  // local id, byte) triple.
+  uint8_t zc_addr_for_zone_(uint8_t zone) const {
+    uint8_t base = zc_enabled() ? zc_address_ : ADDR_ZONE_CTRL;
+    return base + (zone >= 1 ? (zone - 1) / 4 : 0);
+  }
+  // Local zone id (1-4) within that controller for system zone N.
+  uint8_t zc_local_id_for_zone_(uint8_t zone) const {
+    return ((zone >= 1 ? zone - 1 : 0) % 4) + 1;
+  }
+  // Local byte offset (0-3) for per-controller registers where each controller
+  // numbers its own zones 1-4 (e.g. the 0302 zone-temp TLV). NOT for the
+  // system-wide damper registers — use zc_system_byte_for_zone_ for those.
+  uint8_t zc_byte_for_zone_(uint8_t zone) const {
+    return (zone >= 1 ? zone - 1 : 0) % 4;
+  }
+  // System byte offset for the damper registers (0308 command, 0319 state).
+  // These are an 8-byte payload, one byte per system zone 1-8, written
+  // identically to both controllers — 0x60 acts on bytes 0-3, 0x61 on 4-7 —
+  // so zone N is at byte N-1, not (N-1)%4 (that local-id mapping aliases
+  // zones 5-8 onto 1-4).
+  uint8_t zc_system_byte_for_zone_(uint8_t zone) const {
+    return (zone >= 1 ? zone - 1 : 0);
+  }
+  // True if addr is one of our emulated ZC addresses (primary 0x60, and
+  // secondary 0x61 only when a zone >4 is configured with a sensor).
+  bool is_emu_zc_addr_(uint8_t addr) const {
+    if (!zc_enabled())
+      return false;
+    if (addr == zc_address_)
+      return true;
+    return addr == (uint8_t)(zc_address_ + 1) && zc_secondary_enabled_();
+  }
+  // Secondary ZC (0x61, zones 5-8) is only emulated when at least one of those
+  // zones has a temperature_sensor wired. Emulating an empty 0x61 would cause
+  // the thermostat to commission zones 5-8 during discovery even though no
+  // zones live there.
+  bool zc_secondary_enabled_() const {
+    for (uint8_t z = 5; z <= 8; z++)
+      if (zc_zones_[z].temp_sensor != nullptr)
+        return true;
+    return false;
+  }
+
+  // --- NIM emulation (branch-local experiment; PROTOCOL.md "NIM (0x80)") ---
+  void set_nim_address(uint8_t addr) { nim_address_ = addr; }
+  uint8_t get_nim_address() const { return nim_address_; }
+  bool nim_enabled() const { return nim_address_ != 0; }
+  bool is_emu_nim_addr_(uint8_t addr) const { return nim_enabled() && addr == nim_address_; }
+
+  // Defrost input: wire a binary_sensor (e.g. the HP's defrost signal via an
+  // optocoupler) into the emulation; its state drives 0316[14]. Emulation
+  // only — a passive install ignores it.
+  void set_nim_defrost_sensor(binary_sensor::BinarySensor *s);
+
+  // Hardware-control events, ZC-cover style (see infinitesp_cover.h): the hub
+  // reports demand/state, user yaml acts on it. Each fires with the new value
+  // as the lambda arg, on change only — the tstat re-sends 0305 every cycle,
+  // and per-write firing would spam automations.
+  Trigger<int> *get_nim_heat_stage_trigger() { return &nim_heat_stage_trigger_; }
+  Trigger<int> *get_nim_cool_stage_trigger() { return &nim_cool_stage_trigger_; }
+  Trigger<bool> *get_nim_defrost_trigger() { return &nim_defrost_trigger_; }
+
+  // True if this zone's damper is open (receiving conditioned air). Reads the
+  // damper COMMAND register 0308, not 0319: the secondary controller returns
+  // all-FF on 0319, so 0308 is the only reliably-populated source. No 0308
+  // seen yet → true (single-zone/unknown systems track the system 1:1); the
+  // zone's damper byte is 0x00-0x0F and nonzero means open.
+  bool zone_damper_open(uint8_t zone) const {
+    auto *data = get_register(zc_addr_for_zone_(zone), REG_ZC_DAMPER_CMD);
+    if (!data || zone < 1)
+      return true;
+    uint8_t idx = zc_system_byte_for_zone_(zone);
+    if (idx >= data->size())
+      return true;
+    return (*data)[idx] != 0;
+  }
+  void set_temperature_unit(TemperatureUnit unit) { temperature_unit_ = unit; }
+  TemperatureUnit get_temperature_unit() const { return temperature_unit_; }
+  void register_entity(InfinitESPEntity *entity) { entities_.push_back(entity); }
+  // Optional version text sensor: parent publishes INFINITESP_VERSION to it once.
+  void set_version_text_sensor(text_sensor::TextSensor *s) { version_text_sensor_ = s; }
+
+  // Status LED configuration
+#ifdef USE_INFINITESP_STATUS_LED_PIN
+  void set_status_led_pin(GPIOPin *pin) { status_led_gpio_ = pin; }
+#endif
+#ifdef USE_INFINITESP_STATUS_LIGHT
+  void set_status_light(light::LightState *light) { status_light_ = light; }
+#endif
+
+  void set_zone_setpoint(uint8_t zone, uint8_t heat_sp, uint8_t cool_sp);
+  // Half-degree °C path (issue #49, touch generation only). 3B03 cannot
+  // carry halves (21.5 and 22.0 share byte 22); the comfort row can (°C×2).
+  // Live-verified recipe (2026-10-13, three experiments):
+  //   - hold ACTIVE on the zone: row-only write (func 0x0C full-row
+  //     read-modify-write, the proven 2026-09-08 table-40 path). Returns
+  //     true — caller skips the 3B03 write. Any 3B03 write regenerates the
+  //     manual entry from the override's rounded value and stomps the half
+  //     (observed orders row-first and 3B03-first both reverting within one
+  //     poll; row-only held across polls).
+  //   - NO hold: returns false and queues a DEFERRED row write (~10 s) — the
+  //     caller's usual rounded 3B03 write arms the override, the thermostat
+  //     regenerates the manual entry from it, and the deferred row write
+  //     lands the exact half afterwards.
+  // Returns false (whole-degree fallback, nothing queued) when SAM is off,
+  // the bus is °F, or the comfort row is unavailable (UID01/UIZ generation:
+  // no table 40 on the bus).
+  bool command_setpoint_half(uint8_t zone, bool is_heat, float target_c);
+  // PRODUCTION (phase3-control build, 2026-10-30 — NOT part of upstream
+  // InfinitESP; exists only in the diy-thermostat control-components copy).
+  // Direct-write control of the zone-1 comfort row's MANUAL entry
+  // (register 0x400A, byte 28 = heat, byte 29 = cool, whole °F), the path
+  // proven at the wall in the phase3-test build (project
+  // 400A-TEST-RESULT.md): full-row func-0x0C read-modify-write from the
+  // poll cache. Guards in the shared core (write_manual_entry_): SAM off,
+  // value outside 40-99 °F, row not cached, row cache older than 10 min,
+  // value equal to the stored byte (no-op), or a result that would break
+  // the deadband cool >= heat + 3 °F against the other byte's CURRENT
+  // STORED value — all refuse (or no-op) with a log line and no frame.
+  // No 3B03 traffic is emitted and no hold is armed: the wall must be
+  // running its Touch-N-Go MANUAL entry for the values to govern.
+  bool write_manual_cool(uint8_t fahrenheit);
+  bool write_manual_heat(uint8_t fahrenheit);
+  // Read-back of the node's current knowledge of the 400A manual entry:
+  // the byte values from the poll cache (which our own writes also update,
+  // write-through; the next slow poll reconciles with the wall). -1 when
+  // the row is not cached yet. get_comfort_cache_age_ms() returns the
+  // millis() age of the (0x20, 0x400A) cache entry, UINT32_MAX when the
+  // register has never been stored.
+  int get_manual_heat_f() const;
+  int get_manual_cool_f() const;
+  uint32_t get_comfort_cache_age_ms() const;
+  // PHASE 4 (phase4-sensor build, 2026-11-03 — NOT part of upstream
+  // InfinitESP; exists only in the diy-thermostat sensor-components
+  // copy). Same treatment for the manual entry's FAN byte (row byte 30
+  // = COMFORT_MANUAL entry offset 2; FAN_AUTO=0, FAN_LOW=1, FAN_MED=2,
+  // FAN_HIGH=3): full-row func-0x0C read-modify-write from the poll
+  // cache, write-through cache update. Guards in write_manual_fan_entry_:
+  // SAM off, value outside 0-3, row not cached, row cache older than
+  // 10 min, value equal to the stored byte (no-op) — NO deadband: the
+  // fan byte is not part of the heat/cool setpoint pair. The getter
+  // returns -1 while the row is not cached yet.
+  bool write_manual_fan(uint8_t fan_mode);
+  int get_manual_fan() const;
+  // ============================================================
+  // PHASE 5 (phase5-hardened build, 2026-11-24 — NOT part of upstream
+  // InfinitESP; exists only in the diy-thermostat phase5-components
+  // copy). Generalized guarded write-core for ALL FIVE comfort-row
+  // activities (home/away/sleep/wake/manual) plus the phase-5 safety
+  // gates. Every 400A write in this build — the ten HA profile
+  // numbers, sensor steering, fan circulation — funnels through the
+  // single private core write_comfort_bytes_() (see its declaration
+  // below): the phase-3/4 guards (SAM on, range, row cached, row
+  // cache <= 10 min, equality no-op, deadband cool >= heat + 3 on the
+  // RESULTING pair) PLUS a bus-health gate (a thermostat reply to one
+  // of our polls within BUS_HEALTH_MAX_REPLY_AGE_MS — write-through
+  // cache updates do NOT count, only real replies stamp it) PLUS a
+  // global minimum interval between queued comfort writes
+  // (COMFORT_WRITE_MIN_INTERVAL_MS). write_activity_pair() changes
+  // both setpoint bytes of one activity in ONE frame (the atomic
+  // form of the phase-4 pair-unlock). The fan byte goes through the
+  // same core; in the phase5 yaml it is reachable ONLY from the
+  // fan-circulation lambda behind a default-off enable switch,
+  // because byte 30 has never been write-tested live.
+  // ============================================================
+  bool write_activity_heat(uint8_t activity, uint8_t fahrenheit);
+  bool write_activity_cool(uint8_t activity, uint8_t fahrenheit);
+  bool write_activity_pair(uint8_t activity, uint8_t heat_f, uint8_t cool_f);
+  bool write_activity_fan(uint8_t activity, uint8_t fan_mode);
+  // Read-back getters for any activity (row bytes from the poll
+  // cache; -1 while the row is not cached yet).
+  int get_activity_heat_f(uint8_t activity) const;
+  int get_activity_cool_f(uint8_t activity) const;
+  int get_activity_fan(uint8_t activity) const;
+  // Bus health: age of the last thermostat reply to one of our polls
+  // (UINT32_MAX when none yet), and the gate predicate itself.
+  uint32_t get_tstat_reply_age_ms() const;
+  bool bus_healthy() const;
+  // Live equipment state from PASSIVE snooping (the thermostat's own
+  // polls of the furnace/ODU), for the phase-5 steering/circulation
+  // lambdas — the SAM 3B02 state this Ion serves is all zeros, so the
+  // stock climate's mode/action/current-temperature are NOT usable
+  // (see PHASE5.md section 1). get_blower_rpm: -1 when unknown/stale.
+  // get_compressor_state: -1 unknown, 0 off, 1 running (ODU 0604
+  // actual RPM != 0 — the same decode as the Compressor Running
+  // binary sensor).
+  int get_blower_rpm() const;
+  int get_compressor_state() const;
+  void set_zone_fan(uint8_t zone, uint8_t fan_mode);
+  void set_zone_hold(uint8_t zone, uint16_t duration_minutes, const char *source);
+  void set_system_mode(uint8_t mode);
+  // Sets SAM 3B02 byte 28 (which zone the wall unit displays). ACKed by every
+  // tstat tested; adoption is generation-dependent (UIZ/UID family yes, newer
+  // ITC touch units ignore it). Issue #37, verified 2026-09-20.
+  void set_displayed_zone(uint8_t zone);
+
+  // Sets the thermostat's displayed clock: SAM 3B02 byte 25 weekday (0=Sunday)
+  // and bytes 26..27 minutes-since-midnight BE16, written with the matching
+  // CHANGE_WEEKDAY/CHANGE_MINUTES flags. Pass CLOCK_KEEP_* to leave a field
+  // unflagged (the tstat applies only flagged fields). Flagged fields MUST
+  // carry caller-fresh values, never the stale mirror: any applied write
+  // with time flags sets the clock to the carried bytes (PROTOCOL.md "Time
+  // ride-along", measured 2026-09-30). Every applied write of this class
+  // resets the UIZ-family seconds counter (issue #45), so call sparingly
+  // and deliberately. Resolution is whole minutes; seconds are tstat-
+  // internal and never travel the bus.
+  void set_displayed_clock(uint8_t weekday, uint16_t minutes);
+  static constexpr uint8_t CLOCK_KEEP_WEEKDAY = 0xFF;    // sentinel: don't flag/change weekday
+  static constexpr uint16_t CLOCK_KEEP_MINUTES = 0xFFFF; // sentinel: don't flag/change minutes
+
+  // Manual clock-sync core (clock phase 3, issue #45): the shared TIME!NOW
+  // path. Resolves time_source_, validates ESP time, and performs ONE 0x180
+  // set_displayed_clock write (weekday + minutes as local wall time).
+  // Returns false WITHOUT writing when: SAM emulation disabled, mirror
+  // unfilled, no time source configured, or ESP time invalid — `detail`
+  // carries a human-readable result either way ("synced ..." / "refused: ...").
+  // Also records it in last_clock_sync_result_ for the diagnostic text
+  // sensor. Manual-only by design (Q11): NO timers, intervals, or on_time
+  // hooks may call this.
+  bool sync_clock_from_source(std::string &detail);
+  const std::string &get_last_clock_sync_result() const { return last_clock_sync_result_; }
+
+  // --- Vacation (SAM 3B04) domain methods ---
+  // Each setter updates the vacation_* member (the source of truth for entity
+  // and sam_ascii reads) AND pushes a SAM.0x3B04 change-frame to the thermostat
+  // so the value propagates to the enforced vacation setpoints/fan (verified
+  // 2026-07-09, reconfirmed 2026-09-21; see the REG3B04_FLAG_* constants).
+  // Hours>0 marks vacation active. All setters guard on sam_enabled() (#38).
+  void set_vacation_days(uint16_t days);     // whole days (ASCII VACDAYS!)
+  void set_vacation_hours(uint16_t hours);   // native 1-h resolution (issue #33)
+  void set_vacation_temp(bool is_min, uint8_t temp);
+  void set_vacation_humidity(bool is_min, uint8_t value);
+  void set_vacation_fan(uint8_t fan_mode);
+
+  // RS485 transmit enable pin
+#ifdef USE_INFINITESP_FLOW_CONTROL_PIN
+  void set_flow_control_pin(GPIOPin *pin) { flow_control_pin_ = pin; }
+#endif
+
+  // Apply a comfort profile activity: writes setpoints+fan from the zone's
+  // comfort row (400A+zone-1) and sets hold
+  void apply_activity(uint8_t zone, uint8_t activity_index, uint16_t hold_duration);
+
+  // One-shot poll of a specific thermostat register (for discovery / debugging)
+  void poll_register(uint8_t table, uint8_t row);
+
+  // ZC zone temperature sensor references
+  void set_zc_temperature_sensor(uint8_t zone, sensor::Sensor *s);
+  void set_zc_sensor_is_fahrenheit(uint8_t zone, bool is_f) {
+    if (zone >= 2 && zone <= 8) zc_zones_[zone].sensor_unit = is_f ? 2 : 1;
+  }
+
+  // Resolve sensor unit: explicit setting, or inherit from bus
+  bool zc_sensor_is_fahrenheit_(uint8_t zone) const {
+    if (zone < 2 || zone > 8) return false;
+    return zc_unit_is_fahrenheit_(zc_zones_[zone]);
+  }
+  void set_zc_staleness_timeout(uint8_t zone, uint32_t timeout_ms);
+
+  // ZC thermistor sensor references — register 0302 ids 0x14 (LAT) / 0x1C (HPT).
+  // Emulation only: feeds an external ESPHome sensor into the ZC 0302 TLV as a
+  // present (tag 0x01) reading. Unlike zones, supply-air thermistors have no
+  // sane ambient fallback — when the sensor is stale/unavailable the entry
+  // reverts to not-installed (tag 0x04) so the thermostat stops seeing it.
+  void set_zc_lat_sensor(sensor::Sensor *s);
+  void set_zc_hpt_sensor(sensor::Sensor *s);
+  void set_zc_lat_is_fahrenheit(bool is_f) { zc_lat_.sensor_unit = is_f ? 2 : 1; }
+  void set_zc_hpt_is_fahrenheit(bool is_f) { zc_hpt_.sensor_unit = is_f ? 2 : 1; }
+  void set_zc_lat_staleness(uint32_t ms) { zc_lat_.staleness_timeout_ms = ms; }
+  void set_zc_hpt_staleness(uint32_t ms) { zc_hpt_.staleness_timeout_ms = ms; }
+
+  const std::vector<uint8_t> *get_register(uint8_t addr, uint16_t key) const;
+  // True when the (addr, key) register was stored within max_age_ms.
+  // Rollover-safe: age uses (uint32_t)(millis() - stamp) subtraction.
+  bool register_fresh_(uint8_t addr, uint16_t key, uint32_t max_age_ms) const;
+  // The ODU's own outdoor sensor at full /16 °F resolution, converted to °C
+  // with the hardcoded ODU conversion (never bus_temp_to_celsius: ODU
+  // registers don't reformat with the tstat units flag). Tries 3E01 slot 0
+  // (two-capacity family) then 0302 TLV ODU_TLV_OAT (variable-speed family);
+  // the families are disjoint so first-valid-wins needs no precedence logic.
+  // Returns NAN when no ODU node holds a fresh, populated reading. Callers
+  // fall back to the thermostat-quantized 3B02 byte.
+  float odu_outdoor_temp_c_() const;
+  // Thermostat 3D02 zone temp at 1/16 °F, converted with the hardcoded
+  // (f-32)x5/9. Entry offset 1 + (zone-1)*5; guards: flags 0x0000 = zone not
+  // installed, raw 0x0000 = invalid, and the -40..250 °F plausibility band.
+  // Freshness-gated on TSTAT_3D02_FRESHNESS_MS. Returns NAN when absent,
+  // stale, or guarded — callers fall back to the display-unit-quantized 3B02
+  // byte and apply their own 5 °C divergence check before using the value.
+  float tstat_zone_temp_c_(uint8_t zone) const;
+  // One-shot diagnostics: log the per-zone flags bytes at the first served
+  // 3D02 reply (feeds the 0x0101/0x0104 source-type question).
+  bool tstat_3d02_served_logged_{false};
+  // 3B02 byte 0: bitmask of commissioned zones (bit zone-1). 0 when unreadable.
+  uint8_t get_zone_active_mask() const;
+  bool is_bus_online() const { return bus_online_; }
+  bool has_real_state() const { return sam_state_received_; }
+
+  // Bus unit detection: returns true if bus values are in °C.
+  // In AUTO mode, uses heuristic (active zone temp <= 50 → °C).
+  // In explicit F/C mode, returns the configured value.
+  bool bus_uses_celsius() const;
+
+  // Convert a bus temperature value to °C for HA display.
+  // Bus is °F or °C depending on detected/configured mode.
+  float bus_temp_to_celsius(float bus_value) const;
+
+  // Convert a HA °C value to bus units (°F or °C depending on mode).
+  float celsius_to_bus_temp(float celsius) const;
+
+  // Convert a comfort profile raw byte to whole-degree °C for comparison/display.
+  // In °F mode, comfort bytes are whole °F.
+  // In °C mode, comfort bytes are half-degrees (byte/2 = °C).
+  float comfort_byte_to_celsius(uint8_t raw) const;
+  // Read-side refinement (issue #49): in °C bus mode, 3B03 setpoints are a
+  // rounded projection of the comfort row (the wall's source of truth, °C×2
+  // halves). If an entry agrees with the rounded bytes within the rounding
+  // band on both bounds, replaces *heat_c/*cool_c with the entry's exact
+  // values. Manual entry is consulted only while the zone holds an override
+  // (that is when the wall stores live setpoints there). °F mode and row-less
+  // installs return false untouched.
+  bool comfort_refine_setpoints(uint8_t zone, uint8_t heat_bus, uint8_t cool_bus,
+                                bool holding, float *heat_c, float *cool_c) const;
+
+  // Convert a whole-degree °C value to comfort profile raw byte.
+  // Inverse of comfort_byte_to_celsius.
+  uint8_t celsius_to_comfort_byte(float celsius) const;
+
+  // Convert a 4012 vacation temp byte to °C for HA display.
+  // Vacation bytes are °C×2 (half-degree) in °C mode and whole °F otherwise
+  // (verified 2026-06-14 F/C register diff) — the same encoding as comfort
+  // rows, NOT the whole-degree setpoint encoding. Keep separate from
+  // comfort_byte_to_celsius: its °C branch is wrong for 400A (always °F);
+  // this one is correct for 4012 only.
+  float vacation_byte_to_celsius(uint8_t raw) const;
+
+  // Convert a whole-degree bus setpoint to °C for HA display.
+  // Setpoints (3B03) are always whole degrees in both modes.
+  float setpoint_to_celsius(uint8_t raw) const;
+
+  // Convert a HA °C value to a whole-degree bus setpoint.
+  uint8_t celsius_to_setpoint(float celsius) const;
+
+  // Get normalized hold duration for a zone (1-indexed).
+  // Carrier protocol uses zones_holding bit + duration<=1 to mean permanent hold;
+  // this method normalizes that to 0xFFFF so callers see a consistent encoding.
+  // Returns 0 = no hold, 0xFFFF (65535) = permanent, else minutes remaining.
+  static constexpr uint16_t HOLD_PERMANENT = 0xFFFF;
+  // Timed-hold grid, verified live 2026-08-27 (issue #25): the thermostat
+  // silently ignores durations below 15 minutes, and its end times land on
+  // quarter-hour boundaries. set_zone_hold() rounds nonzero finite durations
+  // to this grid: nearest 15, clamped to [HOLD_TIMED_MIN, HOLD_TIMED_MAX].
+  // MAX is the largest multiple of 15 under the documented 23:59 SAM01 max.
+  static constexpr uint16_t HOLD_TIMED_MIN = 15;
+  static constexpr uint16_t HOLD_TIMED_MAX = 1425;
+  // Normalize a finite timed-hold duration onto the thermostat's grid:
+  // nearest 15, clamped to [HOLD_TIMED_MIN, HOLD_TIMED_MAX]. Shared by the
+  // write path (set_zone_hold) and the setter entities' optimistic publishes,
+  // so the UI only ever shows a value the bus will actually produce.
+  static uint16_t normalize_timed_hold(uint16_t duration) {
+    if (duration > HOLD_TIMED_MAX)
+      duration = HOLD_TIMED_MAX;  // before rounding: duration+7 wraps near 0xFFFF
+    uint16_t rounded = ((duration + 7) / 15) * 15;
+    if (rounded < HOLD_TIMED_MIN) rounded = HOLD_TIMED_MIN;
+    if (rounded > HOLD_TIMED_MAX) rounded = HOLD_TIMED_MAX;
+    return rounded;
+  }
+  uint16_t get_zone_hold_duration(uint8_t zone) const;
+
+  // Vacation config + state. Members are written by set_vacation_hours()
+  // (commanded value) and reconciled to the thermostat-served 3B04 reply on
+  // every slow-poll rotation (the served hours is the tstat's ADOPTED value:
+  // 36 h commanded serves 24 on the day-flooring SYSTXCCITC01 touch line; a sub-day
+  // write is not adopted and serves 0). vacation_active_/served freshness
+  // gate the climate Vacation preset; stale or never-served (passive installs)
+  // falls back to the setpoint-match heuristic. Days view rounds UP to whole
+  // days (SAM01/UI display semantics, issue #33).
+  uint16_t get_vacation_days() const { return (vacation_hours_ + 23) / 24; }
+  uint16_t get_vacation_hours() const { return vacation_hours_; }
+  bool is_vacation_active() const { return vacation_active_; }
+  // Served 3B04 is fresh for ~4 missed rotations; beyond that (or never polled:
+  // passive mode) callers must not trust is_vacation_active().
+  bool vacation_state_fresh() const {
+    return vacation_served_ms_ != 0 && (millis() - vacation_served_ms_) < VACATION_SERVED_STALE_MS;
+  }
+  uint8_t get_vacation_min_temp() const { return vacation_min_temp_; }
+  uint8_t get_vacation_max_temp() const { return vacation_max_temp_; }
+  uint8_t get_vacation_min_humidity() const { return vacation_min_humidity_; }
+  uint8_t get_vacation_max_humidity() const { return vacation_max_humidity_; }
+  uint8_t get_vacation_fan() const { return vacation_fan_; }
+
+  // Format a hold's end time as "HH:MM AP" from the current bus clock (3B02)
+  // plus hold_minutes. Returns empty string if the bus clock isn't available yet.
+  std::string format_hold_end(uint16_t hold_minutes) const;
+
+  // Bus diagnostic report — streams directly via callback (no heap allocation)
+  void stream_bus_report_(void (*write_fn)(const uint8_t *, size_t, void *), void *ctx);
+  // Direct register manipulation (used by button platform for virtual registers)
+  void store_register_(uint8_t addr, uint16_t key, const std::vector<uint8_t> &data);
+  void notify_entities_(uint8_t device_addr, uint16_t register_key);
+  // notify_entities_ dispatch, delivering on_register_dropped instead.
+  void notify_entities_dropped_(uint8_t device_addr, uint16_t register_key);
+  // No-reply backoff helpers (issue #41). slow_poll_owns_: (dest, reg) is a
+  // slow-poll pair (thermostat fixed + comfort rows, ODU set). The fast poll
+  // (3B02/3B03) is never owned and never drops. drop_poll_target_: dropped
+  // for the session, logs once, notifies entities. reset_poll_misses_: any
+  // reply (FUNC 06 or 0x15 code 0x0a) clears the misses.
+  bool slow_poll_owns_(uint8_t dest, uint16_t reg) const;
+  bool poll_target_dropped_(uint8_t dest, uint16_t reg) const;
+  void record_poll_miss_(uint8_t dest, uint16_t reg);
+  void reset_poll_misses_(uint8_t dest, uint16_t reg);
+  void drop_poll_target_(uint8_t dest, uint16_t reg, const char *why);
+  // Mirror a register into the SAM's own address space (so SAM-served READs return
+  // current values). Marks bus state received for REG_SAM_STATE / REG_SAM_ZONES.
+  void mirror_to_sam_(uint16_t reg_key, const std::vector<uint8_t> &data);
+
+  // Encode a logical hold into a 3B03 register buffer; returns the change_flags
+  // bit to set. All three intents verified live (2026-06-30 permanent/cancel,
+  // 2026-08-27 timed, issue #25).
+  //   duration == 0                  → cancel     (0x02, bit clear → tstat zeroes timer)
+  //   0 < duration < HOLD_PERMANENT  → timed      (0x82 hold|override, bit clear + finite
+  //                                               duration ≥ 15 min in the slot → arms a real
+  //                                               countdown; <15 is silently not adopted;
+  //                                               0x80-alone insufficient, 0x02-alone cancels)
+  //   duration >= HOLD_PERMANENT     → permanent  (0x02, bit set  → tstat adopts dur 0xFFFF)
+  // Must match the reader get_zone_hold_duration().
+  uint8_t encode_hold_(uint16_t duration, uint8_t idx, std::vector<uint8_t> &data) const;
+
+  // Push a SAM.0x3B04 change-frame to the thermostat: data[2]=flag, data[off]=val,
+  // all other bytes 0xFF (header data[0..1]=0). Used by the single-byte vacation
+  // setters (hours is 2 bytes and inlined in set_vacation_days).
+  void push_vacation_frame_(uint8_t flag, uint8_t off, uint8_t val);
+
+  // Queue a comfort-row write to fire delay_ms from now (drained by the
+  // write queue's scan-for-due loop, bus-idle gated, WRITE_ATTEMPTS retries).
+  // Used by command_setpoint_half's no-hold path so the row write lands after
+  // the thermostat's manual-entry regeneration, without blocking younger
+  // urgent writes in the queue.
+  void defer_manual_row_write_(uint16_t reg, const std::vector<uint8_t> &row, uint32_t delay_ms);
+
+  // PRODUCTION (phase3-control build): shared core of write_manual_cool /
+  // write_manual_heat. is_heat selects row offset 28, cool offset 29.
+  // Cache-freshness ceiling for a write: the RMW base row must come from a
+  // poll (or a write-through update of one) no older than this.
+  static constexpr uint32_t MANUAL_WRITE_MAX_CACHE_AGE_MS = 600000;  // 10 min
+  bool write_manual_entry_(bool is_heat, uint8_t fahrenheit);
+
+  // PHASE 4 (phase4-sensor build): sibling core of write_manual_fan —
+  // same shape and same guards in the same order as write_manual_entry_
+  // minus the setpoint-only ones (no °F range, no deadband): SAM off,
+  // fan mode outside 0-3, row not cached, cache older than
+  // MANUAL_WRITE_MAX_CACHE_AGE_MS, value equal to the stored byte
+  // (no-op). Byte offset is COMFORT_MANUAL * COMFORT_ENTRY_SIZE + 2 = 30.
+  // PHASE 5: kept as a thin wrapper over write_comfort_bytes_().
+  bool write_manual_fan_entry_(uint8_t fan_mode);
+
+  // PHASE 5: THE write-core. Every comfort-row (400A) write in this
+  // build goes through here — write_manual_entry_() and
+  // write_manual_fan_entry_() above are wrappers, and the public
+  // write_activity_*() methods call it directly. A negative argument
+  // leaves that byte unchanged; at least one byte must change or the
+  // call is a successful no-op (no frame, no rate-limit consumption).
+  // Guard order: SAM on -> activity in range -> value ranges ->
+  // row cached -> row cache fresh (<= MANUAL_WRITE_MAX_CACHE_AGE_MS)
+  // -> equality no-op -> deadband on the resulting pair -> bus-health
+  // gate -> global rate limit -> queue ONE full-row func-0x0C RMW
+  // frame + write-through cache + rate-limit stamp.
+  bool write_comfort_bytes_(uint8_t activity, int heat_f, int cool_f, int fan_mode);
+  static constexpr uint32_t COMFORT_WRITE_MIN_INTERVAL_MS = 10000;   // global, all 400A writes
+  static constexpr uint32_t BUS_HEALTH_MAX_REPLY_AGE_MS = 60000;     // thermostat must have answered a poll this recently
+  static constexpr uint32_t EQUIP_STATE_MAX_AGE_MS = 120000;         // staleness ceiling for the passive equipment getters
+  uint32_t last_tstat_reply_ms_{0};     // millis() of the last thermostat reply to our poll (0 = never)
+  uint32_t last_comfort_write_ms_{0};   // millis() of the last queued comfort write (0 = never)
+
+  // Vacation config (members). vacation_hours_ is the commanded value between
+  // a write and the next 3B04 slow-poll reply, then the served (adopted) value.
+  // vacation_active_ and vacation_served_ms_ come ONLY from the served reply.
+  // Temps/humidity/fan members stay config-side (setters + 4012/3B04 [6..10]
+  // are not consumed as entities; 4012 owns the vacation temp sensors).
+  uint16_t vacation_hours_{0};       // duration, hours (0 = inactive)
+  bool vacation_active_{false};      // served 3B04 data[3]
+  uint32_t vacation_served_ms_{0};   // millis of last served 3B04 reply (0 = never)
+  uint8_t vacation_min_temp_{60};    // °F or °C per bus unit
+  uint8_t vacation_max_temp_{85};
+  uint8_t vacation_min_humidity_{0};   // 0 = NONE
+  uint8_t vacation_max_humidity_{100}; // 100 = NONE
+  uint8_t vacation_fan_{0};          // 0=auto .. 3=high
+
+  // Decode big-endian IEEE754 float32 from byte vector
+  static float decode_f32_be_(const std::vector<uint8_t> &data, size_t offset) {
+    if (offset + 4 > data.size())
+      return NAN;
+    // Reorder BE bytes to LE for ESP32
+    uint8_t le[4] = {data[offset + 3], data[offset + 2], data[offset + 1], data[offset]};
+    float f;
+    memcpy(&f, le, sizeof(f));
+    return f;
+  }
+
+  // Decode big-endian int16 / 16 from byte vector (temperature encoding)
+  static float decode_int16_f_(const std::vector<uint8_t> &data, size_t offset) {
+    if (offset + 2 > data.size())
+      return NAN;
+    int16_t raw = (int16_t) ((uint16_t) data[offset] << 8) | data[offset + 1];
+    return (float) raw / 16.0f;
+  }
+
+  // --- IDU/ODU field accessors: single source of truth for register offsets ---
+  // Pure decoders of a register's byte vector. Native units (°F for ODU temps,
+  // raw counts for RPM/CFM, native float for 061F). Return NAN if the field
+  // isn't fully present; callers apply unit conversion (°F→°C) and publish.
+  // Both the dispatch logger and the sensor/binary_sensor platforms call these
+  // so the offset table lives in exactly one place.
+
+  // IDU register 0306 (REG_IDU_STATUS): blower RPM, u16 BE at [1..2]
+  static float idu_blower_rpm_(const std::vector<uint8_t> &data) {
+    if (data.size() < 3) return NAN;
+    return (float) (((uint16_t) data[1] << 8) | data[2]);
+  }
+  // IDU register 0316 (REG_IDU_CONFIG): airflow CFM u16 BE at [4..5]
+  static float idu_airflow_cfm_(const std::vector<uint8_t> &data) {
+    if (data.size() < 6) return NAN;
+    return (float) (((uint16_t) data[4] << 8) | data[5]);
+  }
+  // IDU register 0316 (REG_IDU_CONFIG): duct static pressure u16 BE at
+  // [7..8], /65536 → inH2O (full-scale 1.00). Equipment-native value; the
+  // thermostat °F/°C flag never reformats it. 0.000 at blower-off is
+  // plausible-correct (no airflow → no duct static); no sentinel observed
+  // on furnace or fan-coil families.
+  static float idu_static_pressure_(const std::vector<uint8_t> &data) {
+    if (data.size() < 9) return NAN;
+    return (float) (((uint16_t) data[7] << 8) | data[8]) / 65536.0f;
+  }
+  // IDU register 0316: electric heat present, data[0] & 0x03
+  static bool idu_electric_heat_(const std::vector<uint8_t> &data) {
+    return !data.empty() && (data[0] & 0x03) != 0;
+  }
+  // IDU register 0316: system cooling flag, data[2] & 0x03 == 2 while
+  // compressor cooling. Validated against a 16 h capture's independent
+  // demand source (2026-10-24; PROTOCOL "IDU" 0316 row).
+  static bool idu_cooling_(const std::vector<uint8_t> &data) {
+    return data.size() > 2 && (data[2] & 0x03) == 0x02;
+  }
+  // ODU register 0604 (REG_ODU_COMP_SPEED): two uint16 BE pairs per stage.
+  //   [0..1] = target (commanded) RPM  — holds round rated stage speeds
+  //            {0,1500,1700,2460,2800,3650}
+  //   [2..3] = actual (measured) RPM — fluctuates around target
+  //            (slips below the commanded speed under load)
+  // Verified via 0604-vs-060e stage crosstab and the v=0x0484 frame where
+  // actual(3640) != target(2800). See DEVLOG 2026-06-21 and Infinitude
+  // OutdoorUnit.pm 0604 (target_rpm / current_rpm — Infinitude uses 'current'
+  // here but 'actual' elsewhere; InfinitESP unifies on 'actual').
+  static float odu_compressor_target_rpm_(const std::vector<uint8_t> &data) {
+    if (data.size() < 2) return NAN;
+    return (float) (((uint16_t) data[0] << 8) | data[1]);
+  }
+  static float odu_compressor_actual_rpm_(const std::vector<uint8_t> &data) {
+    if (data.size() < 4) return NAN;
+    return (float) (((uint16_t) data[2] << 8) | data[3]);
+  }
+  // ODU register 0608 (REG_ODU_DEMAND): airflow the ODU requests from the
+  // IDU, u16 BE at [5..6], CFM. The IDU may run above it (e.g. strip heat).
+  // Formerly decoded as 0.1 Hz drive frequency: on a 4-ton 24VNA9 both
+  // readings fit the same numbers (1440 = 144.0 Hz = 4320 rpm on a 4-pole
+  // motor, and 1440 CFM at ~360/ton), but issue #7 cross-model data
+  // (display-confirmed CFM on a Greenspeed, 2-ton values) rules out frequency.
+  // See DEVLOG 2026-08-29.
+  static float odu_requested_cfm_(const std::vector<uint8_t> &data) {
+    if (data.size() < 7) return NAN;
+    return (float) (((uint16_t) data[5] << 8) | data[6]);
+  }
+  // ODU register 0608 (REG_ODU_DEMAND): expansion valve position at byte [2], 0-100 percent.
+  // Proven from bus captures: ramps through intermediate values (39-95%) over 10-15s on
+  // compressor start/stop transitions, settles at 100% while running and 0% while off.
+  // The full-stroke travel time rules out a boolean status flag or a fan/load percent.
+  // Discovered by feisley; confirmed across 8 transitions in the bus-logger archive.
+  static float odu_expansion_valve_(const std::vector<uint8_t> &data) {
+    return data.size() >= 3 ? (float) data[2] : NAN;
+  }
+  // ODU register 060e (REG_ODU_STAGE_INFO): variable-speed stage index at byte 0
+  // {0=off, 1..5=stage}. Verified against rpm-derived stage; resolves the
+  // frequency ambiguity (1500/1700 rpm both read stage 1).
+  static float odu_stage_(const std::vector<uint8_t> &data) {
+    return data.size() >= 1 ? (float) data[0] : NAN;
+  }
+  // ODU register 060B (REG_ODU_SETPOINT): variable target value at byte[2], native °F whole degrees.
+  // Write-only (thermostat→ODU). Offset fix: was data[4] (always 0); data[2] carries the value.
+  // Range 25-115°F, varies independently of OAT and zone setpoints. NOT confirmed to be a
+  // cooling setpoint (the thermostat does not tell the ODU an indoor setpoint); likely a
+  // refrigerant-loop coil/discharge control target. No sensor exposed - kept for future decode.
+  static float odu_setpoint_f_(const std::vector<uint8_t> &data) {
+    return data.size() >= 3 ? (float) data[2] : NAN;
+  }
+  // ODU register 0605 (REG_ODU_CMD_STAGE): commanded compressor stage, float32 BE at [0..3]
+  // (0.0=off, 1.0..5.0=stage). Write-only; drives actual stage (060e) with ~15s lag.
+  static float odu_commanded_stage_(const std::vector<uint8_t> &data) {
+    return decode_f32_be_(data, 0);
+  }
+  // ODU register 0304 (REG_ODU_STATUS3): line voltage at data[7], whole volts.
+  // Validated against Carrier cloud linevolt field: bus 0304[7]=238-240 vs cloud 239V.
+  // State-independent (held tight ±1 LSB across idle and across user's wider observations).
+  static float odu_line_voltage_(const std::vector<uint8_t> &data) {
+    return data.size() >= 8 ? (float) data[7] : NAN;
+  }
+  // ODU register 0304 (REG_ODU_STATUS3): operating mode at data[10]
+  static float odu_operating_mode_(const std::vector<uint8_t> &data) {
+    return data.size() >= 11 ? (float) data[10] : NAN;
+  }
+  // ODU register 061F (REG_ODU_FLOATS): float idx 1..6 at offset 1 + (idx-1)*4.
+  // idx 1..5 are °F deltas (ΔT, not absolute temps); idx 6 is dimensionless.
+  // idx 5 is a discharge-related control delta (NOT discharge superheat - goes
+  // negative ~75% while running; see Infinitude OutdoorUnit.pm 061F).
+  // Caller converts ΔF→ΔC (×5/9) for idx 1..5; idx 6 passed through.
+  static float odu_float_(const std::vector<uint8_t> &data, uint8_t idx) {
+    return decode_f32_be_(data, 1 + (idx - 1) * 4);
+  }
+  // ODU registers 0302/0303 (REG_ODU_STATUS1/2) are typed-TLV: 4-byte entries
+  // [u16 type, u16 value], value = raw/16. Never reformat with the tstat
+  // units flag. Type codes at file scope above (ODU_TLV_*); the type names
+  // the CHANNEL and the register row fixes the quantity: 0302 = temperatures
+  // (F), 0303 = pressures (PSI). The same 0x130 code is suction line temp in
+  // 0302 and suction pressure in 0303 (24VNA9 family serves both; the
+  // 26VNA148 family serves 0x130 only in 0303 and suction temp as 0x154 in
+  // 0302). Decode by type scan within the register for that quantity, never
+  // by slot position: the same 0302 slot carries 0x130 on the 24VNA9 family
+  // but 0x154 on the 26VNA148 family.
+
+  // Raw value of the nth (0-based) entry of the given type, or NaN when the
+  // register data holds no such entry. Skips type 0x0000 filler entries.
+  static float odu_tlv_raw_(const std::vector<uint8_t> &data, uint16_t type, uint8_t occurrence = 0) {
+    uint8_t seen = 0;
+    for (size_t off = 0; off + 3 < data.size(); off += 4) {
+      uint16_t t = (data[off] << 8) | data[off + 1];
+      if (t != type)
+        continue;
+      if (seen++ < occurrence)
+        continue;
+      uint16_t raw = (data[off + 2] << 8) | data[off + 3];
+      return (float) raw;
+    }
+    return NAN;
+  }
+  // Typed-entry value in native units (F or PSI): raw / 16.
+  static float odu_tlv_value_f_(const std::vector<uint8_t> &data, uint16_t type, uint8_t occurrence = 0) {
+    float raw = odu_tlv_raw_(data, type, occurrence);
+    return std::isnan(raw) ? NAN : raw / 16.0f;
+  }
+  // True when the register holds at least one non-zero byte (the unpopulated
+  // footgun: an all-zero row decodes slot values to 0.0 F = -17.8 C).
+  static bool odu_tlv_populated_(const std::vector<uint8_t> &data) {
+    for (uint8_t b : data)
+      if (b)
+        return true;
+    return false;
+  }
+  // ODU register 3E01 (REG_ODU_3E_TEMPS), 2-stage/two-capacity family: int16 BE
+  // /16 °F slots at slot*2. slot 0 = outdoor ambient, slot 1 = coil temp
+  // (panel-validated on a 24ANA160A: coil tracked 79/80/81 °F with no offset).
+  // A slot with no fitted sensor reads 0x03FF (10-bit max sentinel = 63.9 °F —
+  // plausible-looking garbage; rejected, same footgun class as table-03 zeros).
+  static float odu_3e_meas_f_(const std::vector<uint8_t> &data, uint8_t slot) {
+    size_t off = (size_t) slot * 2;
+    if (off + 1 >= data.size())
+      return NAN;
+    uint16_t raw = ((uint16_t) data[off] << 8) | data[off + 1];
+    if (raw == 0x03FF)
+      return NAN;  // unpopulated sensor slot
+    return (float) raw / 16.0f;
+  }
+  // ODU register 3E02 (REG_ODU_3E_STAGE), 2-stage/two-capacity family: stage
+  // byte, fed by the ODU's read replies ONLY (01=off, 02, 04). The thermostat
+  // also writes this register (00/02/04), but the write capture skips it
+  // (issue #47): on a single-stage 24ANB6 the write means "on" (02) while the
+  // reply reports the one capacity with the 2-stage high code (04), so storing
+  // both under the ODU key made odu_stage flap 1/2. On agreeing-encoding units
+  // (24ANA1, #21) write and reply decode the same after >>1, so the skip is a
+  // no-op there. Transitions panel-validated on a 24ANA160A (LOW at 18:20:28,
+  // HIGH at 18:22:19, matching the panel readings).
+  // Raw > 0x07 is not an observed stage value; rejected.
+  static float odu_3e_stage_(const std::vector<uint8_t> &data) {
+    if (data.empty() || data[0] > 0x07)
+      return NAN;
+    return (float) (data[0] >> 1);
+  }
+
+ protected:
+  void parse_byte_(uint8_t byte);
+  void try_parse_buffer_();
+  size_t find_frame_sync_(size_t from);
+  bool validate_frame_(uint16_t frame_len);
+  void dispatch_frame_(uint16_t frame_len);
+  void handle_passive_frame_();
+
+  void transmit_frame_(uint8_t dst, uint8_t dst_bus, uint8_t src, uint8_t src_bus, uint8_t func,
+                       const std::vector<uint8_t> &payload);
+  void send_frame_(uint8_t dst, uint8_t dst_bus, uint8_t func, const std::vector<uint8_t> &payload);
+  // Queue a WRITE frame for transmission from loop(). Entries drain FIFO,
+  // bus-idle gated, with up to WRITE_ATTEMPTS sends per frame. Callers write
+  // idempotent values (setpoints/fan/mode/holds). A 3B03 write also echoes the cached
+  // hold durations; the queued copy has them zeroed unless the write sets a hold
+  // (zero_echoed_hold_durations_).
+  // Immediate transmission is NOT done here: an unguarded send can collide
+  // with the thermostat's reply window right after a preceding frame (lost
+  // 3B02 mode write, captured 2026-09-10). The idle gate plus retries rides
+  // out bus contention instead.
+  // Coupling: RETRANSMIT_DELAY_MS must stay <= PENDING_SETPOINT_WINDOW_MS/2
+  // (InfinitESPClimate) so a retry always lands inside the newest change's
+  // overlay window and cannot cause UI snapback.
+  void send_write_frame_(uint8_t dst, uint8_t dst_bus, const std::vector<uint8_t> &payload);
+  void send_reply_(uint8_t dst, uint8_t dst_bus, uint8_t src, uint8_t src_bus, const std::vector<uint8_t> &payload);
+  void send_exception_(uint8_t dst, uint8_t dst_bus, uint8_t src, uint8_t src_bus, uint8_t table, uint8_t row, uint8_t code);
+
+  void handle_read_request_();
+  void handle_write_request_();
+  void handle_reply_();
+  void handle_discovery_reply_();
+  void handle_metric_units_reply_(uint8_t device_addr, uint16_t reg_key, const std::vector<uint8_t> &data);
+  void poll_metric_units_();
+
+  void poll_thermostat_();
+  void poll_discovery_();
+  // Slow-poll the observed class-5 (ODU) devices for the union register set
+  // (table 03 + table 3E) so curated odu_* sensors work regardless of which
+  // registers the local thermostat polls. Entries refused with FUNC 0x15 are
+  // blacklisted for the session (see handle_exception_).
+  void poll_odu_slow_();
+  // FUNC 0x15 (exception) addressed to us: match the pending poll by dest+
+  // recency (the payload is a bare code, no register echo), blacklist the
+  // (addr, reg) pair, and avoid the 5s POLL TIMEOUT warn + reply_timeout
+  // inflation that an unmatched refusal would otherwise cause.
+  void handle_exception_();
+  // FUNC 0x15 to ADDR_FAKESAM (0x93): a device refusing a tabledef probe.
+  // Retires the pair for the session, same as a non-printable reply.
+  void handle_discovery_exception_();
+  // True when install/commissioning discovery (ADDR_DISCOVERY 0x1F) was seen
+  // recently and initiated bus TX should be paused (issue #8). Reactive
+  // handling (READ/WRITE) is not gated. Returns false until the first 0x1F
+  // frame is observed (discovery_seen_), so a steady-state boot pays no
+  // polling penalty.
+  bool commissioning_holdoff_active_() const {
+    return discovery_seen_ && (millis() - last_discovery_ms_ < DISCOVERY_HOLDOFF_MS);
+  }
+  void initialize_defaults_();
+  void update_zc_zone_temp_(uint8_t zone, float temp_f);
+  void write_zc_zone_temp_entry_(uint8_t zone, float temp_f, bool present);
+  void check_zc_sensor_fallback_();
+  void on_zc_sensor_update_(uint8_t zone, float value);
+  void register_zc_thermistor_(ZCZoneConfig &slot, uint8_t tlv_id, sensor::Sensor *s);
+  void on_zc_thermistor_update_(ZCZoneConfig &slot, uint8_t tlv_id, float value);
+  bool zc_unit_is_fahrenheit_(const ZCZoneConfig &slot) const;
+  // Write a ZC 0302 TLV entry by id: tag (0x01 present / 0x04 not-installed) and
+  // uint16-BE value (temp_f * 16). Idempotent; stores + notifies on change.
+  void write_zc_temp_entry_(uint8_t zc_addr, uint8_t tlv_id, float temp_f, bool present);
+  // Mirror a 4-byte damper command (0308) into the 8-byte 0319 state register:
+  // bytes 0-3 = damper positions, bytes 4-7 = 0xFF. Shared by the emulated-ZC
+  // write path and the passive physical-ZC capture.
+  void mirror_damper_to_0319_(uint8_t addr, const std::vector<uint8_t> &damper);
+
+  // Bus traffic capture for diagnostics / protocol reverse engineering
+  struct TrafficEntry {
+    uint32_t count{0};
+    std::vector<uint8_t> last_payload;
+    uint32_t last_seen_ms{0};
+  };
+  // Key: (src << 24) | (dst << 16) | (func << 8) | (reg_key & 0xFF)
+  // Uses reg_key low byte only to keep key in 32 bits — sufficient for traffic grouping
+  // since the table byte is already encoded in reg_key's high byte, which we fold differently.
+  // Actually: key = (src << 24) | (dst << 16) | (func << 8) | ((table ^ row) & 0xFF) is lossy.
+  // Better: use uint64_t or a small struct key.
+  struct TrafficKey {
+    uint8_t src, dst, func;
+    uint16_t reg_key;
+    bool operator<(const TrafficKey &o) const {
+      if (src != o.src) return src < o.src;
+      if (dst != o.dst) return dst < o.dst;
+      if (func != o.func) return func < o.func;
+      return reg_key < o.reg_key;
+    }
+  };
+  std::map<TrafficKey, TrafficEntry> traffic_log_;
+  // Optional bus_jsonl stream sink (set_bus_jsonl).
+  BusFrameSink *frame_sink_{nullptr};
+  time::RealTimeClock *time_source_{nullptr};  // TIME!NOW source; null = refuse (see set_time_source)
+  std::string last_clock_sync_result_{"never"};  // last sync_clock_from_source() outcome
+  void log_traffic_(uint8_t src, uint8_t dst, uint8_t func, uint16_t reg_key,
+                     const std::vector<uint8_t> &payload);
+
+  // Recent write frame capture (for protocol reverse engineering via REPORT)
+  static const size_t WRITE_CAPTURE_MAX = 32;
+  struct WriteCapture {
+    uint8_t src;
+    uint8_t dst;
+    uint16_t reg_key;
+    std::vector<uint8_t> payload;
+  };
+  std::deque<WriteCapture> write_captures_;
+
+  // Hold-command audit ring (Q13: the 2026-10-27 spontaneous hold-cancel
+  // had no log listener attached, so its caller went unidentified). Every
+  // set_zone_hold() appends {millis, zone, minutes, source}; REPORT?
+  // surfaces it as hold_events[]. Cancels (minutes==0) also log at WARN so
+  // any attached capture names the caller without post-hoc reconstruction.
+  static const size_t HOLD_EVENT_MAX = 16;
+  struct HoldEvent {
+    uint32_t ms;
+    uint8_t zone;
+    uint16_t minutes;
+    char source[12];
+  };
+  std::deque<HoldEvent> hold_events_;
+
+  uint16_t compute_crc_(const uint8_t *data, uint16_t len) const;
+
+  // Per-device register storage: address → (register_key → data)
+  std::map<uint8_t, std::map<uint16_t, std::vector<uint8_t>>> device_registers_;
+  // millis() stamp of the last store_register_() per (addr, register_key),
+  // for freshness-gated sources (outdoor temperature repoint, issue #53).
+  std::map<uint8_t, std::map<uint16_t, uint32_t>> register_last_ms_;
+
+  // Table names learned by probing each observed device's 0xNN01 tabledef
+  // register as ADDR_FAKESAM (0x93). Keyed by (device addr, table number).
+  std::map<std::pair<uint8_t, uint8_t>, std::string> table_names_;
+  std::map<std::pair<uint8_t, uint8_t>, uint32_t> discovery_query_ms_;  // last query ts (retry backoff)
+  // (device, table) pairs whose 0xNN01 probe returned non-printable data: the
+  // table has no self-describing row 01 (e.g. table 3E serves live register
+  // data there). Remembered so the discovery poller stops retrying them.
+  std::set<std::pair<uint8_t, uint8_t>> no_tabledef_;
+  // No-reply backoff state (issue #41). poll_backoff_ keys (dest, reg) for
+  // the slow pollers; discovery_misses_/discovery_backoff_ key (addr, table)
+  // for the tabledef poller. RAM-only: a reboot re-probes everything, bounded
+  // to one timeout window per dropped target per boot.
+  struct PollBackoff {
+    uint8_t misses{0};
+    bool dropped{false};
+  };
+  std::map<std::pair<uint8_t, uint16_t>, PollBackoff> poll_backoff_;
+  std::map<std::pair<uint8_t, uint8_t>, uint8_t> discovery_misses_;
+  std::set<std::pair<uint8_t, uint8_t>> discovery_backoff_;
+  uint32_t last_discovery_poll_ms_{0};
+
+  // Install-discovery holdoff (issue #8). last_discovery_ms_ is stamped on
+  // any frame with src/dst == ADDR_DISCOVERY (0x1F); discovery_seen_ gates the
+  // holdoff arithmetic so a never-commissioned bus pays no polling penalty
+  // (last_discovery_ms_ defaults to 0, which millis()-from-zero would falsely
+  // read as "recent"). discovery_holdoff_engaged_ tracks the logged state for
+  // one-shot engage/disengage logging.
+  static constexpr uint32_t DISCOVERY_HOLDOFF_MS = 180000;
+  uint32_t last_discovery_ms_{0};
+  bool discovery_seen_{false};
+  bool discovery_holdoff_engaged_{false};
+
+  std::vector<uint8_t> rx_buffer_;
+  std::vector<uint8_t> rx_hex_log_;
+  InfinitESPFrame current_frame_;
+  std::vector<InfinitESPEntity *> entities_;
+  text_sensor::TextSensor *version_text_sensor_{nullptr};
+  bool version_published_{false};
+  uint8_t sam_address_{ADDR_FAKESAM};
+  uint8_t zc_address_{0};  // 0 = zone controller emulation disabled
+  uint8_t idu_address_{0};  // 0 = IDU class matching (default)
+  uint8_t odu_address_{0};  // 0 = ODU class matching (default)
+  bool experimental_heat_source_modes_{false};
+  ZCZoneConfig zc_zones_[9];  // index 0=unused, 1-8=zones (2-8 may have external sensors)
+  ZCZoneConfig zc_lat_;       // LAT thermistor (register 0302 id 0x14)
+  ZCZoneConfig zc_hpt_;       // HPT thermistor (register 0302 id 0x1C)
+
+  // NIM emulation state
+  uint8_t nim_address_{0};  // 0 = NIM emulation disabled
+  Trigger<int> nim_heat_stage_trigger_;
+  Trigger<int> nim_cool_stage_trigger_;
+  Trigger<bool> nim_defrost_trigger_;
+  int8_t nim_last_heat_{-1};  // last heat stage fired; -1 = never (first demand fires)
+  int8_t nim_last_cool_{-1};
+  int8_t nim_last_defrost_{-1};  // passive-mode 0316[14] guard (emulation path is input-driven)
+  // Handle a 0305 demand write: store, mirror into 0316, fire triggers.
+  void handle_nim_demand_write_(const std::vector<uint8_t> &data);
+
+  // Passive NIM monitoring (ZC-style, zero transmission): file an OBSERVED
+  // class-8 frame into the register store under the real bus address and
+  // fire the on_heat_stage/on_cool_stage/on_defrost triggers on value
+  // changes (shared nim_last_* guards make the tstat's ~10 s standing
+  // re-sends fire once per actual change). Demand (0305) arrives as a
+  // tstat->NIM WRITE; status (0316, incl. defrost [14]) as NIM->tstat
+  // REPLY. Never transmits; used only when nim_address is 0.
+  void observe_nim_frame_(uint8_t addr, uint16_t reg_key, const std::vector<uint8_t> &data);
+  // Update one byte of the stored NIM 0316; notifies entities. Returns true
+  // if the value changed.
+  bool update_nim_status_byte_(uint8_t offset, uint8_t value);
+  // Defrost input callback (set_nim_defrost_sensor wiring).
+  void on_nim_defrost_input_(bool state);
+  uint32_t last_zc_sensor_check_{0};
+  uint32_t last_rx_time_{0};
+  uint32_t last_poll_time_{0};
+  uint8_t poll_index_{0};
+  uint8_t slow_poll_index_{0};
+  uint32_t last_slow_poll_time_{0};
+  uint8_t odu_slow_poll_index_{0};
+  // Init UINT32_MAX - 15500: with the 31s interval, the first ODU slow poll
+  // comes due at t≈15.5s — half a cycle out of phase with the thermostat slow
+  // poll (first due at t≈31s), so the two rotations never share a loop
+  // iteration and never collide with each other's in-flight replies.
+  uint32_t last_odu_slow_poll_time_{UINT32_MAX - 15500};
+  bool bus_online_{false};
+  bool sam_state_received_{false};
+  uint32_t last_reply_time_{0};
+
+  // Diagnostics
+  uint32_t diag_total_rx_bytes_{0};
+  uint32_t diag_total_tx_bytes_{0};
+  uint32_t diag_frames_parsed_{0};
+  uint32_t diag_crc_fail_{0};
+  uint32_t diag_stale_discard_{0};
+  uint32_t diag_ingress_drop_{0};  // stray 0xFE/0xFF dropped at frame boundary (issue #55)
+  uint32_t diag_resync_{0};       // CRC-fail recoveries via signature scan (issue #55)
+  uint32_t diag_last_stats_time_{0};
+  bool diag_in_tx_{false};
+
+
+
+  // Frame-drop debugging
+  uint32_t diag_rx_seq_{0};        // monotonically increasing RX frame sequence
+  uint32_t diag_tx_seq_{0};        // monotonically increasing TX frame sequence
+  uint32_t diag_uart_hwm_{0};      // UART RX buffer high-water mark (bytes available at loop entry)
+  uint32_t diag_uart_overflow_events_{0};  // times available() > 75% of rx_buffer_size
+  uint32_t diag_reply_expected_{0};   // total REPLY frames we expected (matched to our READs)
+  uint32_t diag_reply_received_{0};   // total REPLY frames we actually received
+  uint32_t diag_reply_timeout_{0};    // polls that timed out without a reply
+  uint32_t diag_poll_dropped_{0};     // slow-poll/discovery targets dropped this session
+  uint32_t diag_ack_consumed_{0};     // write ACKs that dropped a pending retransmit
+  uint32_t diag_tx_flush_max_ms_{0};  // max time spent in flush()
+  uint32_t diag_loop_max_ms_{0};      // max time spent in a single loop() iteration
+  uint32_t diag_last_frame_time_{0};  // millis() of last complete frame (inter-frame stats only; the TX idle gate uses last_rx_time_)
+  uint32_t last_own_tx_ms_{0};        // millis() of our last transmit; the receiver never sees it (see loop())
+  uint32_t diag_inter_frame_min_ms_{UINT32_MAX};  // min inter-frame interval
+  uint32_t diag_inter_frame_max_ms_{0};            // max inter-frame interval
+
+  // Outstanding poll tracking: maps (dest_addr << 16 | reg_key) -> TX seq number
+  struct PendingPoll {
+    uint32_t tx_seq;
+    uint32_t sent_ms;
+    uint8_t dest;
+    uint16_t reg_key;
+  };
+  std::vector<PendingPoll> pending_polls_;
+
+  // Queued write frames. Each entry transmits from loop() at fire_ms behind
+  // the bus-idle gate, up to attempts_left + 1 sends total, FIFO. An entry
+  // is dropped when a bare [00] REPLY from its destination acknowledges the
+  // write (write-ACK block in dispatch_frame_); `sent` gates that match so
+  // an ACK never drops an unsent write. With RETRANSMIT_DELAY_MS <=
+  // overlay/2, the last-sent value for a zone always wins on the bus
+  // regardless of rapid change ordering.
+  struct PendingRetransmit {
+    uint8_t dst;
+    uint8_t dst_bus;
+    uint8_t func;   // FUNC_WRITE
+    std::vector<uint8_t> payload;
+    uint32_t fire_ms;
+    uint8_t attempts_left;
+    bool sent = false;
+  };
+  std::deque<PendingRetransmit> pending_retransmits_;
+
+  // Deferred mode-write adoption check: armed when the retransmit queue
+  // drains a 3B02 mode write, checked MODE_ADOPT_VERIFY_MS later against
+  // the served stagmode nibble (see loop()).
+  uint32_t mode_verify_deadline_ms_ = 0;
+  uint8_t mode_verify_nibble_ = 0;
+
+  // Debounced timed-hold sets from the setter entities (queue_hold_set).
+  struct PendingHoldSet {
+    uint16_t minutes;
+    uint32_t until_ms;
+    bool active;
+    char source[12];  // setter tag ("hold-min"/"hold-until"), rides to the audit ring
+  };
+  PendingHoldSet pending_hold_sets_[8] = {};
+  // Cached WiFi credentials discovered from thermostat register 4608
+  // Stored in NVS, injected into WiFi component on boot if WiFi hasn't connected yet
+  struct CachedWifi {
+    char ssid[33];     // null-terminated, max 32 chars + \0
+    char password[65]; // null-terminated, max 64 chars + \0
+  };
+  ESPPreferenceObject wifi_pref_;
+  std::string cached_wifi_ssid_;
+  std::string cached_wifi_password_;
+  bool wifi_cache_dirty_{false};
+  bool wifi_injected_{false};  // one-shot: inject cached WiFi once after boot
+
+  void cache_wifi_credentials_(const std::string &ssid, const std::string &password);
+  void inject_cached_wifi_();
+
+  uint32_t diag_poll_purged_{0};  // polls purged due to timeout
+
+  // Status LED support (optional, configured via YAML)
+  // Two mutually exclusive modes:
+  //   USE_INFINITESP_STATUS_LED_PIN  — direct GPIO pin (simple on/off/brightness via LEDC)
+  //   USE_INFINITESP_STATUS_LIGHT   — reference to an ESPHome light entity (RGB support)
+#ifdef USE_INFINITESP_STATUS_LED_PIN
+  GPIOPin *status_led_gpio_{nullptr};
+  bool status_led_physical_{false};   // current physical state
+  uint32_t status_led_last_toggle_{0}; // last blink toggle time
+#endif
+#ifdef USE_INFINITESP_STATUS_LIGHT
+  light::LightState *status_light_{nullptr};
+  bool status_light_has_rgb_{false};   // cached from traits check
+  uint32_t status_light_last_update_{0};
+#endif
+
+  // Unified status LED state tracking (used by both modes)
+  // Sequential narrative: yellow blink (bus not ready) → blue blink (wifi not ready) → green (all good)
+  enum class StatusLedState : uint8_t {
+    BUS_NOT_READY = 0,  // bus not fully online (yellow blink / mono blink)
+    WIFI_NOT_READY,     // bus ok, wifi not connected (blue blink / mono fast blink)
+    ALL_GOOD,           // both bus and wifi up (solid green / mono solid)
+  };
+  StatusLedState status_led_state_{StatusLedState::BUS_NOT_READY};
+
+  void update_status_led_();
+
+  // Temperature unit configuration and detected state
+  TemperatureUnit temperature_unit_{TemperatureUnit::AUTO};
+  bool bus_celsius_detected_{false};  // cached heuristic result (AUTO mode)
+  bool bus_unit_detected_{false};     // true after first successful detection
+  // Authoritative metric-units flag, read from the thermostat's 3B06 push
+  // (when sam emulated — the tstat pushes 3B06 to 0x92, captured under addr
+  // 0x20) or polled from 3B05 as FakeSAM (when sam NOT emulated). 3B05/3B06
+  // data[1]: 0=English(°F), 1=Metric(°C). Verified live 2026-06-26.
+  // metric_units_known_=false until first authoritative read → heuristic fallback.
+  bool metric_units_known_{false};
+  bool metric_units_{false};         // valid only when metric_units_known_
+  uint32_t last_unit_poll_ms_{0};
+
+  // RS485 transmit enable pin (optional)
+#ifdef USE_INFINITESP_FLOW_CONTROL_PIN
+  GPIOPin *flow_control_pin_{nullptr};
+#endif
+};
+
+// Automation action `infinitesp.sync_clock` (clock phase 3): fires the
+// manual sync core from yaml automations / HA device actions. Composable
+// twin of the "Sync Thermostat Clock" button and sam_ascii TIME!NOW — all
+// three share InfinitESPComponent::sync_clock_from_source(). Defined after
+// InfinitESPComponent: play() calls a member, so the full class must be
+// visible (a forward declaration alone is an invalid use of an incomplete
+// type — it links only by luck of name mangling and breaks on any signature
+// change).
+template<typename... Ts>
+class SyncClockAction : public Action<Ts...> {
+ public:
+  explicit SyncClockAction(InfinitESPComponent *parent) : parent_(parent) {}
+  void play(Ts... x) override {
+    std::string detail;
+    parent_->sync_clock_from_source(detail);
+  }
+
+ protected:
+  InfinitESPComponent *parent_;
+};
+
+}  // namespace infinitesp
+}  // namespace esphome

@@ -1,0 +1,17 @@
+# Secrets — never commit real credentials
+**/secrets.yaml
+
+# ESPHome build state
+.esphome/
+**/__pycache__/
+
+# Raw bus captures and vendor material — not redistributed
+traces/
+*.bin
+*.hex
+*.BEX
+*.pdf
+
+# OS/editor noise
+.DS_Store
+*.swp
